@@ -190,6 +190,8 @@ static int hexit( char c );
 static int b64_decode( const char* str, unsigned char* space, int size );
 static int match( const char* pattern, const char* string );
 static int match_one( const char* pattern, int patternlen, const char* string );
+static void set_ndelay( int fd );
+static void clear_ndelay( int fd );
 
 
 int
@@ -1186,9 +1188,8 @@ post_post_garbage_hack( void )
     char buf[2];
     int r;
 
-    r = recv( conn_fd, buf, sizeof(buf), MSG_PEEK );
-    if ( r > 0 )
-	(void) read( conn_fd, buf, r );
+    set_ndelay( conn_fd );
+    (void) read( conn_fd, buf, sizeof(buf) );
     }
 
 
@@ -2301,4 +2302,36 @@ match_one( const char* pattern, int patternlen, const char* string )
     if ( *string == '\0' )
 	return 1;
     return 0;
+    }
+
+
+/* Set NDELAY mode on a socket. */
+static void
+set_ndelay( int fd )
+    {
+    int flags, newflags;
+
+    flags = fcntl( fd, F_GETFL, 0 );
+    if ( flags != -1 )
+	{
+	newflags = flags | (int) O_NDELAY;
+	if ( newflags != flags )
+	    (void) fcntl( fd, F_SETFL, newflags );
+	}
+    }
+
+
+/* Clear NDELAY mode on a socket. */
+static void
+clear_ndelay( int fd )
+    {
+    int flags, newflags;
+
+    flags = fcntl( fd, F_GETFL, 0 );
+    if ( flags != -1 )
+	{
+	newflags = flags & ~ (int) O_NDELAY;
+	if ( newflags != flags )
+	    (void) fcntl( fd, F_SETFL, newflags );
+	}
     }

@@ -6,15 +6,13 @@
 
 # CONFIGURE: If you want to compile in support for https, uncomment these
 # definitions.  You will need to have already built OpenSSL, available at
-# http://www.openssl.org/  If you're using FreeBSD you can just go to
-# /usr/ports/security/openssl and do a make install.  Make sure the
-# SSL_INCDIR and SSL_LIBDIR definitions here point to your OpenSSL
-# installation's location.
-#SSL_INCDIR =	/usr/local/include
-#SSL_LIBDIR =	/usr/local/lib
+# http://www.openssl.org/  Make sure the SSL_TREE definition points to the
+# tree with your OpenSSL installation - depending on how you installed it,
+# it may be in /usr/local instead of /usr/local/ssl.
+#SSL_TREE =	/usr/local/ssl
 #SSL_DEFS =	-DUSE_SSL
-#SSL_INC =	-I$(SSL_INCDIR)
-#SSL_LIBS =	-L$(SSL_LIBDIR) -lssl -lcrypto -lRSAglue -lrsaref
+#SSL_INC =	-I$(SSL_TREE)/include
+#SSL_LIBS =	-L$(SSL_TREE)/lib -lssl -lcrypto
 
 # CONFIGURE: If you want to try building an IPv6-enabled version of
 # mini_httpd, uncomment these definitions.  Of course this will only

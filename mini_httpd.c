@@ -27,7 +27,6 @@
 
 
 #include "version.h"
-#include "port.h"
 
 #include <unistd.h>
 #include <stdlib.h>
@@ -48,8 +47,15 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 
+#include "port.h"
+
+#ifdef HAVE_SENDFILE
+#include <sys/uio.h>
+#endif /* HAVE_SENDFILE */
+
 #ifdef USE_SSL
 #include <openssl/ssl.h>
+#include <openssl/err.h>
 #endif /* USE_SSL */
 
 
@@ -148,6 +154,7 @@ static void do_file( void );
 static void do_dir( void );
 static void do_cgi( void );
 static void cgi_interpose_input( int wfd );
+static void post_post_garbage_hack( void );
 static void cgi_interpose_output( int rfd, int parse_headers );
 static char** make_argp( void );
 static char** make_envp( void );
@@ -176,6 +183,7 @@ static void handle_sigterm( int sig );
 static void handle_sigchld( int sig );
 static void lookup_hostname( usockaddr* usa4P, size_t sa4_len, int* gotv4P, usockaddr* usa6P, size_t sa6_len, int* gotv6P );
 static char* ntoa( usockaddr* usaP );
+static int sockaddr_check( usockaddr* usaP );
 static size_t sockaddr_len( usockaddr* usaP );
 static void strdecode( char* to, char* from );
 static int hexit( char c );
@@ -560,29 +568,52 @@ initialize_listen_socket( usockaddr* usaP )
     int listen_fd;
     int i;
 
+    /* Check sockaddr. */
+    if ( ! sockaddr_check( usaP ) )
+	{
+	(void) fprintf(
+	    stderr, "unknown sockaddr family on listen socket - %d\n",
+	    usaP->sa.sa_family );
+	return -1;
+	}
+
     listen_fd = socket( usaP->sa.sa_family, SOCK_STREAM, 0 );
     if ( listen_fd < 0 )
 	{
 	perror( "socket" );
 	return -1;
 	}
+
     (void) fcntl( listen_fd, F_SETFD, 1 );
+
     i = 1;
     if ( setsockopt( listen_fd, SOL_SOCKET, SO_REUSEADDR, (char*) &i, sizeof(i) ) < 0 )
 	{
-	perror( "setsockopt" );
+	perror( "setsockopt SO_REUSEADDR" );
 	return -1;
 	}
+
+#ifdef HAVE_ACCEPT_FILTERS
+    {
+    struct accept_filter_arg af;
+    (void) bzero( &af, sizeof(af) );
+    (void) strcpy( af.af_name, ACCEPT_FILTER_NAME );
+    (void) setsockopt( listen_fd, SOL_SOCKET, SO_ACCEPTFILTER, (char*) &af, sizeof(af) );
+    }
+#endif /* HAVE_ACCEPT_FILTERS */
+
     if ( bind( listen_fd, &usaP->sa, sockaddr_len( usaP ) ) < 0 )
 	{
 	perror( "bind" );
 	return -1;
 	}
+
     if ( listen( listen_fd, 1024 ) < 0 )
 	{
 	perror( "listen" );
 	return -1;
 	}
+
     return listen_fd;
     }
 
@@ -866,15 +897,39 @@ do_file( void )
     send_response();
     if ( method == METHOD_HEAD )
 	return;
-    if ( sb.st_size > 0 )	/* avoid zero-length mmap */
+
+    if ( sb.st_size > 0 )	/* ignore zero-length files */
 	{
+#ifdef HAVE_SENDFILE
+
+#ifndef USE_SSL
+	(void) sendfile( fd, conn_fd, 0, 0, 0, 0, 0 );
+#else /* USE_SSL */
+	if ( ! do_ssl )
+	    (void) sendfile( fd, conn_fd, 0, 0, 0, 0, 0 );
+	else
+	    {
+	    ptr = mmap( 0, sb.st_size, PROT_READ, MAP_SHARED, fd, 0 );
+	    if ( ptr != (void*) -1 )
+		{
+		(void) my_write( ptr, sb.st_size );
+		(void) munmap( ptr, sb.st_size );
+		}
+	    }
+#endif /* USE_SSL */
+
+#else /* HAVE_SENDFILE */
+
 	ptr = mmap( 0, sb.st_size, PROT_READ, MAP_SHARED, fd, 0 );
 	if ( ptr != (void*) -1 )
 	    {
 	    (void) my_write( ptr, sb.st_size );
 	    (void) munmap( ptr, sb.st_size );
 	    }
+
+#endif /* HAVE_SENDFILE */
 	}
+
     (void) close( fd );
     }
 
@@ -978,6 +1033,7 @@ do_cgi( void )
 	    }
 	(void) close( p[1] );
 	(void) dup2( p[0], STDIN_FILENO );
+	(void) close( p[0] );
 	}
     else
 	{
@@ -1016,6 +1072,7 @@ do_cgi( void )
 	(void) close( p[0] );
 	(void) dup2( p[1], STDOUT_FILENO );
 	(void) dup2( p[1], STDERR_FILENO );
+	(void) close( p[1] );
 	}
     else
 	{
@@ -1023,6 +1080,17 @@ do_cgi( void )
 	(void) dup2( conn_fd, STDOUT_FILENO );
 	(void) dup2( conn_fd, STDERR_FILENO );
 	}
+
+    /* At this point we would like to set conn_fd to be close-on-exec.
+    ** Unfortunately there seems to be a Linux problem here - if we
+    ** do this close-on-exec in Linux, the socket stays open but stderr
+    ** gets closed - the last fd duped from the socket.  What a mess.
+    ** So we'll just leave the socket as is, which under other OSs means
+    ** an extra file descriptor gets passed to the child process.  Since
+    ** the child probably already has that file open via stdin stdout
+    ** and/or stderr, this is not a problem.
+    */
+    /* (void) fcntl( conn_fd, F_SETFD, 1 ); */
 
     /* Set priority. */
     (void) nice( CGI_NICE );
@@ -1096,6 +1164,31 @@ cgi_interpose_input( int wfd )
 	    c += r;
 	    }
 	}
+#ifdef USE_SSL
+    if ( ! do_ssl )
+	post_post_garbage_hack();
+#else /* USE_SSL */
+    post_post_garbage_hack();
+#endif /* USE_SSL */
+    }
+
+
+/* Special hack to deal with broken browsers that send a LF or CRLF
+** after POST data, causing TCP resets - we just read and discard up
+** to 2 bytes.  Unfortunately this doesn't fix the problem for CGIs
+** which avoid the interposer process due to their POST data being
+** short.  Creating an interposer process for all POST CGIs is
+** unacceptably expensive.
+*/
+static void
+post_post_garbage_hack( void )
+    {
+    char buf[2];
+    int r;
+
+    r = recv( conn_fd, buf, sizeof(buf), MSG_PEEK );
+    if ( r > 0 )
+	(void) read( conn_fd, buf, r );
     }
 
 
@@ -1599,18 +1692,18 @@ add_headers( int s, char* title, char* extra_header, char* mime_type, long b, ti
 	}
     if ( mime_type != (char*) 0 )
 	{
-	buflen = snprintf( buf, sizeof(buf), "Content-type: %s\r\n", mime_type );
+	buflen = snprintf( buf, sizeof(buf), "Content-Type: %s\r\n", mime_type );
 	add_to_response( buf, buflen );
 	}
     if ( bytes >= 0 )
 	{
-	buflen = snprintf( buf, sizeof(buf), "Content-length: %ld\r\n", bytes );
+	buflen = snprintf( buf, sizeof(buf), "Content-Length: %ld\r\n", bytes );
 	add_to_response( buf, buflen );
 	}
     if ( mod != (time_t) -1 )
 	{
 	(void) strftime( timebuf, sizeof(timebuf), rfc1123_fmt, gmtime( &mod ) );
-	buflen = snprintf( buf, sizeof(buf), "Last-modified: %s\r\n", timebuf );
+	buflen = snprintf( buf, sizeof(buf), "Last-Modified: %s\r\n", timebuf );
 	add_to_response( buf, buflen );
 	}
     buflen = snprintf( buf, sizeof(buf), "Connection: close\r\n\r\n" );
@@ -2010,6 +2103,21 @@ ntoa( usockaddr* usaP )
     }
 
 
+static int
+sockaddr_check( usockaddr* usaP )
+    {
+    switch ( usaP->sa.sa_family )
+	{
+	case AF_INET: return 1;
+#if defined(AF_INET6) && defined(HAVE_SOCKADDR_IN6)
+	case AF_INET6: return 1;
+#endif /* AF_INET6 && HAVE_SOCKADDR_IN6 */
+	default:
+	return 0;
+	}
+    }
+
+
 static size_t
 sockaddr_len( usockaddr* usaP )
     {
@@ -2020,9 +2128,7 @@ sockaddr_len( usockaddr* usaP )
 	case AF_INET6: return sizeof(struct sockaddr_in6);
 #endif /* AF_INET6 && HAVE_SOCKADDR_IN6 */
 	default:
-	(void) fprintf(
-	    stderr, "unknown sockaddr family - %d\n", usaP->sa.sa_family );
-	exit( 1 );
+	return 0;	/* shouldn't happen */
 	}
     }
 

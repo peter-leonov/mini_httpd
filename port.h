@@ -19,25 +19,36 @@
 #endif
 
 #ifdef FreeBSD
+# include <osreldate.h>
 # define HAVE_DAEMON
 # define HAVE_SETSID
 # define HAVE_SETLOGIN
 # define HAVE_WAITPID
 # define HAVE_HSTRERROR
 # define HAVE_TM_GMTOFF
-#endif
+# define HAVE_SENDFILE
+# ifdef SO_ACCEPTFILTER
+#  define HAVE_ACCEPT_FILTERS
+#  if ( __FreeBSD_version >= 411000 )
+#   define ACCEPT_FILTER_NAME "httpready"
+#  else
+#   define ACCEPT_FILTER_NAME "dataready"
+#  endif
+# endif /* SO_ACCEPTFILTER */
+#endif /* FreeBSD */
 
 #ifdef Linux
 # define HAVE_DAEMON
 # define HAVE_SETSID
 # define HAVE_WAITPID
-#endif
+# define HAVE_SENDFILE
+#endif /* Linix */
 
 #ifdef Solaris
 # define HAVE_SETSID
 # define HAVE_WAITPID
 # define HAVE_MEMORY_H
-#endif
+#endif /* Solaris */
 
 #ifdef USE_IPV6
 # define HAVE_SOCKADDR_IN6
@@ -45,4 +56,4 @@
 # define HAVE_GETADDRINFO
 # define HAVE_GETNAMEINFO
 # define HAVE_GAI_STRERROR
-#endif
+#endif /* USE_IPV6 */

@@ -16,9 +16,9 @@
 #SSL_INC =	-I$(SSL_INCDIR)
 #SSL_LIBS =	-L$(SSL_LIBDIR) -lssl -lcrypto -lRSAglue -lrsaref
 
-# CONFIGURE: If you want to try building an IPv6 version of mini_httpd,
-# uncomment these definitions.  Of course this will only succeed if your
-# system supports IPv6.
+# CONFIGURE: If you want to try building an IPv6-enabled version of
+# mini_httpd, uncomment these definitions.  Of course this will only
+# succeed if your system supports IPv6.
 #IPV6_DEFS =	-DUSE_IPV6
 #IPV6_LIBS =	-L/usr/local/v6/lib -linet6
 

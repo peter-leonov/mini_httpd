@@ -75,7 +75,7 @@ Specifies an alternate port number to listen on.
 The default is 80.
 .TP
 .B -c
-Specifies a wildcard pattern for CGI programs, for instance "*.cgi"
+Specifies a wildcard pattern for CGI programs, for instance "**.cgi"
 or "/cgi-bin/*".
 The default is no CGI.
 .TP
@@ -113,7 +113,11 @@ mini_httpd supports the CGI 1.1 spec.
 .PP
 In order for a CGI program to be run, its name must match the pattern
 you specify with the -c flag
-This is a simple shell-style filename pattern, with ? and *, or multiple such patterns separated by |.
+This is a simple shell-style filename pattern.
+You can use * to match any string not including a slash,
+or ** to match any string including slashes,
+or ? to match any single character.
+You can also use multiple such patterns separated by |.
 The patterns get checked against the filename
 part of the incoming URL.
 Don't forget to quote any wildcard characters so that the shell doesn't
@@ -232,7 +236,7 @@ multihosting - for that, you must use a single mini_httpd process with
 the -v flag.
 .SH "CUSTOM ERRORS"
 .PP 
-thttpd lets you define your own custom error pages for the various
+mini_httpd lets you define your own custom error pages for the various
 HTTP errors.
 There's a separate file for each error number, all stored in one
 special directory.
@@ -248,7 +252,7 @@ If you're using the virtual hosts option, you can also have different
 custom error pages for each different virtual host.
 In this case you put another "errors" directory in the top of that
 virtual host's web tree.
-thttpd will look first in the virtual host errors directory, and
+mini_httpd will look first in the virtual host errors directory, and
 then in the server-wide errors directory, and if neither of those
 has an appropriate error file then it will generate the built-in error.
 .SH SIGNALS

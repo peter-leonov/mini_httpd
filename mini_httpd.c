@@ -52,10 +52,6 @@
 #include <openssl/ssl.h>
 #endif /* USE_SSL */
 
-#ifdef HAVE_NETINET6_IN6_H
-#include <netinet6/in6.h> 
-#endif 
-
 
 #define ERR_DIR "errors"
 #define DEFAULT_HTTP_PORT 80
@@ -105,7 +101,7 @@ static u_int hostaddr;
 static char* logfile;
 static char* pidfile;
 static FILE* logfp;
-static int listen_fd;
+static int listen4_fd, listen6_fd;
 #ifdef USE_SSL
 static int do_ssl;
 static SSL_CTX* ssl_ctx;
@@ -144,6 +140,7 @@ static char* remoteuser;
 
 /* Forwards. */
 static void usage( void );
+static int initialize_listen_socket( usockaddr* usaP );
 static void handle_request( void );
 static void de_dotdot( char* file );
 static void do_file( void );
@@ -176,7 +173,7 @@ static char* get_method_str( int m );
 static char* get_mime_type( char* name );
 static void handle_sigterm( int sig );
 static void handle_sigchld( int sig );
-static void lookup_hostname( usockaddr* usaP, size_t sa_len );
+static void lookup_hostname( usockaddr* usa4P, size_t sa4_len, int* gotv4P, usockaddr* usa6P, size_t sa6_len, int* gotv6P );
 static char* ntoa( usockaddr* usaP );
 static size_t sockaddr_len( usockaddr* usaP );
 static void strdecode( char* to, char* from );
@@ -191,9 +188,13 @@ main( int argc, char** argv )
     {
     int argn;
     uid_t uid;
-    usockaddr host_addr;
+    usockaddr host_addr4;
+    usockaddr host_addr6;
+    int gotv4, gotv6;
+    fd_set afdset;
+    int maxfd;
     usockaddr usa;
-    int i, sz, r;
+    int sz, r;
 
     /* Parse args. */
     argv0 = argv[0];
@@ -284,38 +285,28 @@ main( int argc, char** argv )
 	}
 
     /* Look up hostname. */
-    lookup_hostname( &host_addr, sizeof(host_addr) );
+    lookup_hostname(
+	&host_addr4, sizeof(host_addr4), &gotv4,
+	&host_addr6, sizeof(host_addr6), &gotv6 );
     if ( hostname == (char*) 0 )
 	{
 	(void) gethostname( hostname_buf, sizeof(hostname_buf) );
 	hostname = hostname_buf;
 	}
-
-    /* Set up listen socket. */
-    listen_fd = socket( host_addr.sa.sa_family, SOCK_STREAM, 0 );
-    if ( listen_fd < 0 )
+    if ( ! ( gotv4 || gotv6 ) )
 	{
-	perror( "socket" );
-	exit( 1 );
-	}
-    (void) fcntl( listen_fd, F_SETFD, 1 );
-    i = 1;
-    if ( setsockopt( listen_fd, SOL_SOCKET, SO_REUSEADDR, (char*) &i, sizeof(i) ) < 0 )
-	{
-	perror( "setsockopt" );
+	(void) fprintf( stderr, "can't find any valid address\n" );
 	exit( 1 );
 	}
 
-    if ( bind( listen_fd, &host_addr.sa, sockaddr_len( &host_addr ) ) < 0 )
-	{
-	perror( "bind" );
-	exit( 1 );
-	}
-    if ( listen( listen_fd, 1024 ) < 0 )
-	{
-	perror( "listen" );
-	exit( 1 );
-	}
+    if ( gotv4 )
+	listen4_fd = initialize_listen_socket( &host_addr4 );
+    else
+	listen4_fd = -1;
+    if ( gotv6 )
+	listen6_fd = initialize_listen_socket( &host_addr6 );
+    else
+	listen6_fd = -1;
 
 #ifdef USE_SSL
     if ( do_ssl )
@@ -466,13 +457,52 @@ main( int argc, char** argv )
     /* Main loop. */
     for (;;)
 	{
+	/* Possibly do a select() on the possible two listen fds. */
+	FD_ZERO( &afdset );
+	maxfd = -1;
+	if ( listen4_fd != -1 )
+	    {
+	    FD_SET( listen4_fd, &afdset );
+	    if ( listen4_fd > maxfd )
+		maxfd = listen4_fd;
+	    }
+	if ( listen6_fd != -1 )
+	    {
+	    FD_SET( listen6_fd, &afdset );
+	    if ( listen6_fd > maxfd )
+		maxfd = listen6_fd;
+	    }
+	if ( listen4_fd != -1 && listen6_fd != -1 )
+	    if ( select( maxfd + 1, &afdset, (fd_set*) 0, (fd_set*) 0, (struct timeval*) 0 ) < 0 )
+		{
+		perror( "select" );
+		exit( 1 );
+		}
+	/* (If we don't have two listen fds, we can just skip the select()
+	** and fall through.  Whichever listen fd we do have will do a
+	** blocking accept() instead.)
+	*/
+
+	/* Accept the new connection. */
 	sz = sizeof(usa);
-	conn_fd = accept( listen_fd, &usa.sa, &sz );
+	if ( listen4_fd != -1 && FD_ISSET( listen4_fd, &afdset ) )
+	    conn_fd = accept( listen4_fd, &usa.sa, &sz );
+	else if ( listen6_fd != -1 && FD_ISSET( listen6_fd, &afdset ) )
+	    conn_fd = accept( listen6_fd, &usa.sa, &sz );
+	else
+	    {
+	    (void) fprintf( stderr, "%s: select failure\n", argv0 );
+	    exit( 1 );
+	    }
 	if ( conn_fd < 0 )
 	    {
+	    if ( errno == EINTR )
+		continue;	/* try again */
 	    perror( "accept" );
 	    exit( 1 );
 	    }
+
+	/* Fork a sub-process to handle the connection. */
 	r = fork();
 	if ( r < 0 )
 	    {
@@ -483,7 +513,10 @@ main( int argc, char** argv )
 	    {
 	    /* Child process. */
 	    client_addr = usa;
-	    (void) close( listen_fd );
+	    if ( listen4_fd != -1 )
+		(void) close( listen4_fd );
+	    if ( listen6_fd != -1 )
+		(void) close( listen6_fd );
 	    handle_request();
 	    exit( 0 );
 	    }
@@ -501,6 +534,39 @@ usage( void )
     (void) fprintf( stderr, "usage:  %s [-p port] [-c cgipat] [-u user] [-h hostname] [-r] [-v] [-l logfile] [-i pidfile]\n", argv0 );
 #endif /* USE_SSL */
     exit( 1 );
+    }
+
+
+static int
+initialize_listen_socket( usockaddr* usaP )
+    {
+    int listen_fd;
+    int i;
+
+    listen_fd = socket( usaP->sa.sa_family, SOCK_STREAM, 0 );
+    if ( listen_fd < 0 )
+	{
+	perror( "socket" );
+	exit( 1 );
+	}
+    (void) fcntl( listen_fd, F_SETFD, 1 );
+    i = 1;
+    if ( setsockopt( listen_fd, SOL_SOCKET, SO_REUSEADDR, (char*) &i, sizeof(i) ) < 0 )
+	{
+	perror( "setsockopt" );
+	exit( 1 );
+	}
+    if ( bind( listen_fd, &usaP->sa, sockaddr_len( usaP ) ) < 0 )
+	{
+	perror( "bind" );
+	exit( 1 );
+	}
+    if ( listen( listen_fd, 1024 ) < 0 )
+	{
+	perror( "listen" );
+	exit( 1 );
+	}
+    return listen_fd;
     }
 
 
@@ -757,7 +823,7 @@ do_file( void )
 	send_error( 403, "Forbidden", (char*) 0, "File is protected." );
 
     /* Is it CGI? */
-    if ( cgi_pattern != (char*) 0 && match( cgi_pattern, path ) )
+    if ( cgi_pattern != (char*) 0 && match( cgi_pattern, file ) )
 	{
 	do_cgi();
 	return;
@@ -817,7 +883,7 @@ do_dir( void )
 	{
 	(void) snprintf(
 	    command, sizeof(command),
-	    "ls -lgF '%s' | tail +2 | sed -e 's/^\\([^ ][^ ]*\\)\\(  *[^ ][^ ]*  *[^ ][^ ]*  *[^ ][^ ]*\\)\\(  *[^ ][^ ]*\\)  *\\([^ ][^ ]*  *[^ ][^ ]*  *[^ ][^ ]*\\)  *\\(.*\\)$/\\1 \\3  \\4  |\\5/' -e '/@ -> /!s,|\\([^*]*\\)$,|<A HREF=\"\\1\">\\1</A>,' -e '/@ -> /!s,|\\(.*\\)\\([*]\\)$,|<A HREF=\"\\1\">\\1</A>\\2,' -e '/@ -> /s,|\\([^@]*\\)@,|<A HREF=\"\\1\">\\1</A>@,' -e 's/|//'",
+	    "ls -lgF '%s' | tail +2 | sed -e 's/^\\([^ ][^ ]*\\)\\(  *[^ ][^ ]*  *[^ ][^ ]*  *[^ ][^ ]*\\)\\(  *[^ ][^ ]*\\)  *\\([^ ][^ ]*  *[^ ][^ ]*  *[^ ][^ ]*\\)  *\\(.*\\)$/\\1 \\3  \\4  |\\5/' -e '/ -> /!s,|\\([^*]*\\)$,|<A HREF=\"\\1\">\\1</A>,' -e '/ -> /!s,|\\(.*\\)\\([*]\\)$,|<A HREF=\"\\1\">\\1</A>\\2,' -e '/ -> /s,|\\([^@]*\\)\\(@* -> \\),|<A HREF=\"\\1\">\\1</A>\\2,' -e 's/|//'",
 	    file );
 	fp = popen( command, "r" );
 	for (;;)
@@ -1728,7 +1794,7 @@ get_mime_type( char* name )
 	if ( strcasecmp( &(name[fl - el]), table[i].ext ) == 0 )
 	    return table[i].type;
 	}
-    return "text/plain";
+    return "text/plain; charset=iso-8859-1";
     }
 
 
@@ -1772,7 +1838,7 @@ handle_sigchld( int sig )
 
 
 static void
-lookup_hostname( usockaddr* usaP, size_t sa_len )
+lookup_hostname( usockaddr* usa4P, size_t sa4_len, int* gotv4P, usockaddr* usa6P, size_t sa6_len, int* gotv6P )
     {
 #if defined(HAVE_GETADDRINFO) && defined(HAVE_GAI_STRERROR)
 
@@ -1780,9 +1846,7 @@ lookup_hostname( usockaddr* usaP, size_t sa_len )
     struct addrinfo* ai;
     struct addrinfo* ai2;
     struct addrinfo* aiv4;
-#if defined(AF_INET6) && defined(HAVE_SOCKADDR_IN6)
     struct addrinfo* aiv6;
-#endif /* AF_INET6 && HAVE_SOCKADDR_IN6 */
     int gaierr;
     char strport[10];
 
@@ -1797,49 +1861,56 @@ lookup_hostname( usockaddr* usaP, size_t sa_len )
 	exit( 1 );
 	}
 
-    /* Scan the returned list for IPv4 and IPv6 entries. */
+    /* Find the first IPv4 and IPv6 entries. */
     aiv4 = (struct addrinfo*) 0;
-#if defined(AF_INET6) && defined(HAVE_SOCKADDR_IN6)
     aiv6 = (struct addrinfo*) 0;
-#endif /* AF_INET6 && HAVE_SOCKADDR_IN6 */
     for ( ai2 = ai; ai2 != (struct addrinfo*) 0; ai2 = ai2->ai_next )
 	{
 	switch ( ai2->ai_family )
 	    {
-	    case AF_INET: aiv4 = ai2; break;
+	    case AF_INET:
+	    if ( aiv4 == (struct addrinfo*) 0 )
+		aiv4 = ai2;
+	    break;
 #if defined(AF_INET6) && defined(HAVE_SOCKADDR_IN6)
-	    case AF_INET6: aiv6 = ai2; break;
+	    case AF_INET6:
+	    if ( aiv6 == (struct addrinfo*) 0 )
+		aiv6 = ai2;
+	    break;
 #endif /* AF_INET6 && HAVE_SOCKADDR_IN6 */
 	    }
 	}
 
-    /* If we found an IPv6 address, use it; otherwise, use an IPv4 address. */
-#if defined(AF_INET6) && defined(HAVE_SOCKADDR_IN6)
-    if ( aiv6 != (struct addrinfo*) 0 )
-	ai2 = aiv6;
-    else
-#endif /* AF_INET6 && HAVE_SOCKADDR_IN6 */
-    if ( aiv4 != (struct addrinfo*) 0 )
-	ai2 = aiv4;
+    if ( aiv4 == (struct addrinfo*) 0 )
+	*gotv4P = 0;
     else
 	{
-	(void) fprintf(
-	    stderr, "getaddrinfo %.80s - can't find my address\n", hostname );
-	exit( 1 );
+	if ( sa4_len < aiv4->ai_addrlen )
+	    {
+	    (void) fprintf(
+		stderr, "%.80s - sockaddr too small (%d < %d)\n",
+		hostname, sa4_len, aiv4->ai_addrlen );
+	    exit( 1 );
+	    }
+	memset( usa4P, 0, sa4_len );
+	memcpy( usa4P, aiv4->ai_addr, aiv4->ai_addrlen );
+	*gotv4P = 1;
 	}
-
-    /* Make sure there's enough space. */
-    if ( sa_len < ai2->ai_addrlen )
+    if ( aiv6 == (struct addrinfo*) 0 )
+	*gotv6P = 0;
+    else
 	{
-	(void) fprintf(
-	    stderr, "%.80s - sockaddr too small (%d < %d)\n",
-	    hostname, sa_len, ai2->ai_addrlen );
-	exit( 1 );
+	if ( sa6_len < aiv6->ai_addrlen )
+	    {
+	    (void) fprintf(
+		stderr, "%.80s - sockaddr too small (%d < %d)\n",
+		hostname, sa6_len, aiv6->ai_addrlen );
+	    exit( 1 );
+	    }
+	memset( usa6P, 0, sa6_len );
+	memcpy( usa6P, aiv6->ai_addr, aiv6->ai_addrlen );
+	*gotv6P = 1;
 	}
-
-    /* Copy the chosen entry. */
-    memset( usaP, 0, sa_len );
-    memcpy( usaP, ai2->ai_addr, ai2->ai_addrlen );
 
     freeaddrinfo( ai );
 
@@ -1847,14 +1918,16 @@ lookup_hostname( usockaddr* usaP, size_t sa_len )
 
     struct hostent* he;
 
-    memset( usaP, 0, sa_len );
-    usaP->sa.sa_family = AF_INET;
+    *gotv6P = 0;
+
+    memset( usa4P, 0, sa4_len );
+    usa4P->sa.sa_family = AF_INET;
     if ( hostname == (char*) 0 )
-	usaP->sa_in.sin_addr.s_addr = htonl( INADDR_ANY );
+	usa4P->sa_in.sin_addr.s_addr = htonl( INADDR_ANY );
     else
 	{
-	usaP->sa_in.sin_addr.s_addr = inet_addr( hostname );
-	if ( (int) usaP->sa_in.sin_addr.s_addr == -1 )
+	usa4P->sa_in.sin_addr.s_addr = inet_addr( hostname );
+	if ( (int) usa4P->sa_in.sin_addr.s_addr == -1 )
 	    {
 	    he = gethostbyname( hostname );
 	    if ( he == (struct hostent*) 0 )
@@ -1872,10 +1945,11 @@ lookup_hostname( usockaddr* usaP, size_t sa_len )
 		exit( 1 );
 		}
 	    (void) memcpy(
-		&usaP->sa_in.sin_addr.s_addr, he->h_addr, he->h_length );
+		&usa4P->sa_in.sin_addr.s_addr, he->h_addr, he->h_length );
 	    }
 	}
-    usaP->sa_in.sin_port = htons( port );
+    usa4P->sa_in.sin_port = htons( port );
+    *gotv4P = 1;
 
 #endif /* HAVE_GETADDRINFO && HAVE_GAI_STRERROR */
     }
@@ -2033,7 +2107,7 @@ b64_decode( const char* str, unsigned char* space, int size )
     }
 
 
-/* Simple shell-style filename matcher.  Only does ? and *, and multiple
+/* Simple shell-style filename matcher.  Only does ? * and **, and multiple
 ** patterns separated by |.  Returns 1 or 0.
 */
 int
@@ -2066,8 +2140,17 @@ match_one( const char* pattern, int patternlen, const char* string )
 	    {
 	    int i, pl;
 	    ++p;
+	    if ( *p == '*' )
+		{
+		/* Double-wildcard matches anything. */
+		++p;
+		i = strlen( string );
+		}
+	    else
+		/* Single-wildcard matches anything but slash. */
+		i = strcspn( string, "/" );
 	    pl = patternlen - ( p - pattern );
-	    for ( i = strlen( string ); i >= 0; --i )
+	    for ( ; i >= 0; --i )
 		if ( match_one( p, pl, &(string[i]) ) )
 		    return 1;
 	    return 0;

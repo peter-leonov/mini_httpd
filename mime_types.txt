@@ -3,13 +3,13 @@
 # A list of file extensions followed by the corresponding MIME type.
 # Extensions not found in the table are returned as text/plain.
 
-.html		text/html
-.htm		text/html
+.html		text/html; charset=iso-8859-1
+.htm		text/html; charset=iso-8859-1
+.txt		text/plain; charset=iso-8859-1
 .rtx		text/richtext
 .etx		text/x-setext
 .tsv		text/tab-separated-values
 .css		text/css
-.txt		text/plain
 .xml		text/xml
 .dtd		text/xml
 
@@ -63,6 +63,7 @@
 .dump		application/octet-stream
 .o		application/octet-stream
 .class		application/java
+.js		application/x-javascript
 .ai		application/postscript
 .eps		application/postscript
 .ps		application/postscript

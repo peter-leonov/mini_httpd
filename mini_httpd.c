@@ -460,6 +460,9 @@ main( int argc, char** argv )
     /* Catch defunct children. */
     (void) signal( SIGCHLD, handle_sigchld );
 
+    /* And get EPIPE instead of SIGPIPE. */
+    (void) signal( SIGPIPE, SIG_IGN );
+
     /* Main loop. */
     for (;;)
 	{
@@ -957,6 +960,9 @@ do_cgi( void )
 	    }
 	}
 
+    /* Default behavior for SIGPIPE. */
+    (void) signal( SIGPIPE, SIG_DFL );
+
     /* Run the program. */
     (void) execve( binary, argp, envp );
 
@@ -982,7 +988,7 @@ cgi_interpose_input( int wfd )
     c = request_len - request_idx;
     if ( c > 0 )
 	{
-	if ( write( wfd, &(request[request_idx]), c ) < 0 )
+	if ( write( wfd, &(request[request_idx]), c ) != c )
 	    return;
 	}
     while ( c < content_length )
@@ -999,7 +1005,7 @@ cgi_interpose_input( int wfd )
 	    }
 	else
 	    {
-	    if ( write( wfd, buf, r ) < 0 )
+	    if ( write( wfd, buf, r ) != r )
 		return;
 	    c += r;
 	    }
@@ -1101,7 +1107,8 @@ cgi_interpose_output( int rfd, int parse_headers )
 	r = read( rfd, buf, sizeof(buf) );
 	if ( r <= 0 )
 	    return;
-	(void) my_write( buf, r );
+	if ( my_write( buf, r ) != r )
+	    return;
 	}
     }
 
@@ -1669,7 +1676,7 @@ make_log_entry( void )
 #ifdef HAVE_TM_GMTOFF
     zone = t->tm_gmtoff / 60L;
 #else
-    zone = -timezone / 60L;
+    zone = - ( timezone / 60L );
     /* Probably have to add something about daylight time here. */
 #endif
     if ( zone >= 0 )
@@ -1767,7 +1774,7 @@ handle_sigchld( int sig )
 static void
 lookup_hostname( usockaddr* usaP, size_t sa_len )
     {
-#ifdef HAVE_GETADDRINFO
+#if defined(HAVE_GETADDRINFO) && defined(HAVE_GAI_STRERROR)
 
     struct addrinfo hints;
     struct addrinfo* ai;
@@ -1836,7 +1843,7 @@ lookup_hostname( usockaddr* usaP, size_t sa_len )
 
     freeaddrinfo( ai );
 
-#else /* HAVE_GETADDRINFO */
+#else /* HAVE_GETADDRINFO && HAVE_GAI_STRERROR */
 
     struct hostent* he;
 
@@ -1870,7 +1877,7 @@ lookup_hostname( usockaddr* usaP, size_t sa_len )
 	}
     usaP->sa_in.sin_port = htons( port );
 
-#endif /* HAVE_GETADDRINFO */
+#endif /* HAVE_GETADDRINFO && HAVE_GAI_STRERROR */
     }
 
 

@@ -45,4 +45,5 @@
 # define HAVE_SOCKADDR_STORAGE
 # define HAVE_GETADDRINFO
 # define HAVE_GETNAMEINFO
+# define HAVE_GAI_STRERROR
 #endif

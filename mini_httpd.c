@@ -30,12 +30,16 @@
 
 #include <unistd.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <syslog.h>
+#include <limits.h>
+#include <sys/param.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
-#include <sys/time.h>
+#include <time.h>
 #include <pwd.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -44,13 +48,21 @@
 #include <sys/wait.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <dirent.h>
 
 #include "port.h"
+#include "match.h"
+#include "tdate_parse.h"
 
 #ifdef HAVE_SENDFILE
-#include <sys/uio.h>
+# ifdef HAVE_LINUX_SENDFILE
+#  include <sys/sendfile.h>
+# else /* HAVE_LINUX_SENDFILE */
+#  include <sys/uio.h>
+# endif /* HAVE_LINUX_SENDFILE */
 #endif /* HAVE_SENDFILE */
 
 #ifdef USE_SSL
@@ -58,61 +70,124 @@
 #include <openssl/err.h>
 #endif /* USE_SSL */
 
+extern char* crypt( const char* key, const char* setting );
 
+
+#if defined(AF_INET6) && defined(IN6_IS_ADDR_V4MAPPED)
+#define USE_IPV6
+#endif
+
+#ifndef STDIN_FILENO
+#define STDIN_FILENO 0
+#endif
+#ifndef STDOUT_FILENO
+#define STDOUT_FILENO 1
+#endif
+#ifndef STDERR_FILENO
+#define STDERR_FILENO 2
+#endif
+
+#ifndef SHUT_WR
+#define SHUT_WR 1
+#endif
+
+#ifndef SIZE_T_MAX
+#define SIZE_T_MAX 2147483647L
+#endif
+
+#ifndef max
+#define max(a,b) ((a) > (b) ? (a) : (b))
+#endif
+#ifndef min
+#define min(a,b) ((a) < (b) ? (a) : (b))
+#endif
+
+
+#ifndef ERR_DIR
 #define ERR_DIR "errors"
+#endif /* ERR_DIR */
+#ifndef DEFAULT_HTTP_PORT
 #define DEFAULT_HTTP_PORT 80
+#endif /* DEFAULT_HTTP_PORT */
 #ifdef USE_SSL
+#ifndef DEFAULT_HTTPS_PORT
 #define DEFAULT_HTTPS_PORT 443
-#define CERT_FILE "cert.pem"
-#define KEY_FILE "key.pem"
+#endif /* DEFAULT_HTTPS_PORT */
+#ifndef DEFAULT_CERTFILE
+#define DEFAULT_CERTFILE "mini_httpd.pem"
+#endif /* DEFAULT_CERTFILE */
 #endif /* USE_SSL */
+#ifndef DEFAULT_USER
 #define DEFAULT_USER "nobody"
+#endif /* DEFAULT_USER */
+#ifndef CGI_NICE
 #define CGI_NICE 10
+#endif /* CGI_NICE */
+#ifndef CGI_PATH
 #define CGI_PATH "/usr/local/bin:/usr/ucb:/bin:/usr/bin"
+#endif /* CGI_PATH */
+#ifndef CGI_LD_LIBRARY_PATH
 #define CGI_LD_LIBRARY_PATH "/usr/local/lib:/usr/lib"
+#endif /* CGI_LD_LIBRARY_PATH */
+#ifndef AUTH_FILE
 #define AUTH_FILE ".htpasswd"
+#endif /* AUTH_FILE */
+#ifndef READ_TIMEOUT
+#define READ_TIMEOUT 60
+#endif /* READ_TIMEOUT */
+#ifndef WRITE_TIMEOUT
+#define WRITE_TIMEOUT 300
+#endif /* WRITE_TIMEOUT */
+#ifndef DEFAULT_CHARSET
+#define DEFAULT_CHARSET "iso-8859-1"
+#endif /* DEFAULT_CHARSET */
 
+
+#define METHOD_UNKNOWN 0
 #define METHOD_GET 1
 #define METHOD_HEAD 2
 #define METHOD_POST 3
-
-#ifndef MIN
-#define MIN(a,b) ((a) < (b) ? (a) : (b))
-#endif
 
 
 /* A multi-family sockaddr. */
 typedef union {
     struct sockaddr sa;
     struct sockaddr_in sa_in;
-#ifdef HAVE_SOCKADDR_IN6
+#ifdef USE_IPV6
     struct sockaddr_in6 sa_in6;
-#endif /* HAVE_SOCKADDR_IN6 */
-#ifdef HAVE_SOCKADDR_STORAGE
     struct sockaddr_storage sa_stor;
-#endif /* HAVE_SOCKADDR_STORAGE */
+#endif /* USE_IPV6 */
     } usockaddr;
 
 
 static char* argv0;
 static int debug;
-static int port;
+static unsigned short port;
+static char* dir;
+static char* data_dir;
 static int do_chroot;
 static int vhost;
 static char* user;
 static char* cgi_pattern;
+static char* url_pattern;
+static int no_empty_referers;
+static char* local_pattern;
 static char* hostname;
 static char hostname_buf[500];
-static u_int hostaddr;
 static char* logfile;
 static char* pidfile;
 static char* charset;
+static char* p3p;
+static int max_age;
 static FILE* logfp;
 static int listen4_fd, listen6_fd;
 #ifdef USE_SSL
 static int do_ssl;
+static char* certfile;
+static char* cipher;
 static SSL_CTX* ssl_ctx;
 #endif /* USE_SSL */
+static char cwd[MAXPATHLEN];
 
 
 /* Request variables. */
@@ -122,19 +197,20 @@ static SSL* ssl;
 #endif /* USE_SSL */
 static usockaddr client_addr;
 static char* request;
-static int request_size, request_len, request_idx;
+static size_t request_size, request_len, request_idx;
 static int method;
 static char* path;
 static char* file;
+static char* pathinfo;
 struct stat sb;
 static char* query;
 static char* protocol;
 static int status;
-static long bytes;
+static off_t bytes;
 static char* req_hostname;
 
 static char* authorization;
-static long content_length;
+static size_t content_length;
 static char* content_type;
 static char* cookie;
 static char* host;
@@ -147,11 +223,19 @@ static char* remoteuser;
 
 /* Forwards. */
 static void usage( void );
+static void read_config( char* filename );
+static void value_required( char* name, char* value );
+static void no_value_required( char* name, char* value );
 static int initialize_listen_socket( usockaddr* usaP );
 static void handle_request( void );
 static void de_dotdot( char* file );
+static int get_pathinfo( void );
 static void do_file( void );
 static void do_dir( void );
+#ifdef HAVE_SCANDIR
+static char* file_details( const char* dir, const char* name );
+static void strencode( char* to, size_t tosize, const char* from );
+#endif /* HAVE_SCANDIR */
 static void do_cgi( void );
 static void cgi_interpose_input( int wfd );
 static void post_post_garbage_hack( void );
@@ -166,21 +250,30 @@ static void send_error( int s, char* title, char* extra_header, char* text );
 static void send_error_body( int s, char* title, char* text );
 static int send_error_file( char* filename );
 static void send_error_tail( void );
-static void add_headers( int s, char* title, char* extra_header, char* mime_type, long b, time_t mod );
+static void add_headers( int s, char* title, char* extra_header, char* me, char* mt, off_t b, time_t mod );
 static void start_request( void );
-static void add_to_request( char* str, int len );
+static void add_to_request( char* str, size_t len );
 static char* get_request_line( void );
 static void start_response( void );
-static void add_to_response( char* str, int len );
+static void add_to_response( char* str, size_t len );
 static void send_response( void );
-static int my_read( char* buf, int size );
-static int my_write( char* buf, int size );
-static void add_to_buf( char** bufP, int* bufsizeP, int* buflenP, char* str, int len );
+static void send_via_write( int fd, off_t size );
+static ssize_t my_read( char* buf, size_t size );
+static ssize_t my_write( char* buf, size_t size );
+#ifdef HAVE_SENDFILE
+static int my_sendfile( int fd, int socket, off_t offset, size_t nbytes );
+#endif /* HAVE_SENDFILE */
+static void add_to_buf( char** bufP, size_t* bufsizeP, size_t* buflenP, char* str, size_t len );
 static void make_log_entry( void );
+static void check_referer( void );
+static int really_check_referer( void );
 static char* get_method_str( int m );
-static char* get_mime_type( char* name );
+static void init_mime( void );
+static char* figure_mime( char* name, char* me, size_t me_size );
 static void handle_sigterm( int sig );
 static void handle_sigchld( int sig );
+static void handle_read_timeout( int sig );
+static void handle_write_timeout( int sig );
 static void lookup_hostname( usockaddr* usa4P, size_t sa4_len, int* gotv4P, usockaddr* usa6P, size_t sa6_len, int* gotv6P );
 static char* ntoa( usockaddr* usaP );
 static int sockaddr_check( usockaddr* usaP );
@@ -188,33 +281,45 @@ static size_t sockaddr_len( usockaddr* usaP );
 static void strdecode( char* to, char* from );
 static int hexit( char c );
 static int b64_decode( const char* str, unsigned char* space, int size );
-static int match( const char* pattern, const char* string );
-static int match_one( const char* pattern, int patternlen, const char* string );
 static void set_ndelay( int fd );
 static void clear_ndelay( int fd );
+static void* e_malloc( size_t size );
+static void* e_realloc( void* optr, size_t size );
+static char* e_strdup( char* ostr );
+#ifdef NO_SNPRINTF
+static int snprintf( char* str, size_t size, const char* format, ... );
+#endif /* NO_SNPRINTF */
 
 
 int
 main( int argc, char** argv )
     {
     int argn;
-    uid_t uid;
+    uid_t uid = 32767;
     usockaddr host_addr4;
     usockaddr host_addr6;
     int gotv4, gotv6;
-    fd_set afdset;
+    fd_set lfdset;
     int maxfd;
     usockaddr usa;
     int sz, r;
+    char* cp;
 
     /* Parse args. */
     argv0 = argv[0];
     debug = 0;
-    port = -1;
+    port = 0;
+    dir = (char*) 0;
+    data_dir = (char*) 0;
     do_chroot = 0;
     vhost = 0;
     cgi_pattern = (char*) 0;
-    charset = "iso-8859-1";
+    url_pattern = (char*) 0;
+    no_empty_referers = 0;
+    local_pattern = (char*) 0;
+    charset = DEFAULT_CHARSET;
+    p3p = (char*) 0;
+    max_age = -1;
     user = DEFAULT_USER;
     hostname = (char*) 0;
     logfile = (char*) 0;
@@ -222,20 +327,52 @@ main( int argc, char** argv )
     logfp = (FILE*) 0;
 #ifdef USE_SSL
     do_ssl = 0;
+    certfile = DEFAULT_CERTFILE;
+    cipher = (char*) 0;
 #endif /* USE_SSL */
     argn = 1;
     while ( argn < argc && argv[argn][0] == '-' )
 	{
-	if ( strcmp( argv[argn], "-D" ) == 0 )
+	if ( strcmp( argv[argn], "-V" ) == 0 )
+	    {
+	    (void) printf( "%s\n", SERVER_SOFTWARE );
+	    exit( 0 );
+	    }
+	else if ( strcmp( argv[argn], "-C" ) == 0 && argn + 1 < argc )
+	    {
+	    ++argn;
+	    read_config( argv[argn] );
+	    }
+	else if ( strcmp( argv[argn], "-D" ) == 0 )
 	    debug = 1;
 #ifdef USE_SSL
 	else if ( strcmp( argv[argn], "-S" ) == 0 )
 	    do_ssl = 1;
+	else if ( strcmp( argv[argn], "-E" ) == 0 && argn + 1 < argc )
+	    {
+	    ++argn;
+	    certfile = argv[argn];
+	    }
+	else if ( strcmp( argv[argn], "-Y" ) == 0 && argn + 1 < argc )
+	    {
+	    ++argn;
+	    cipher = argv[argn];
+	    }
 #endif /* USE_SSL */
 	else if ( strcmp( argv[argn], "-p" ) == 0 && argn + 1 < argc )
 	    {
 	    ++argn;
-	    port = atoi( argv[argn] );
+	    port = (unsigned short) atoi( argv[argn] );
+	    }
+	else if ( strcmp( argv[argn], "-d" ) == 0 && argn + 1 < argc )
+	    {
+	    ++argn;
+	    dir = argv[argn];
+	    }
+	else if ( strcmp( argv[argn], "-dd" ) == 0 && argn + 1 < argc )
+	    {
+	    ++argn;
+	    data_dir = argv[argn];
 	    }
 	else if ( strcmp( argv[argn], "-c" ) == 0 && argn + 1 < argc )
 	    {
@@ -271,6 +408,16 @@ main( int argc, char** argv )
 	    ++argn;
 	    charset = argv[argn];
 	    }
+	else if ( strcmp( argv[argn], "-P" ) == 0 && argn + 1 < argc )
+	    {
+	    ++argn;
+	    p3p = argv[argn];
+	    }
+	else if ( strcmp( argv[argn], "-M" ) == 0 && argn + 1 < argc )
+	    {
+	    ++argn;
+	    max_age = atoi( argv[argn] );
+	    }
 	else
 	    usage();
 	++argn;
@@ -278,7 +425,14 @@ main( int argc, char** argv )
     if ( argn != argc )
 	usage();
 
-    if ( port == -1 )
+    cp = strrchr( argv0, '/' );
+    if ( cp != (char*) 0 ) 
+	++cp;
+    else
+	cp = argv0;
+    openlog( cp, LOG_NDELAY|LOG_PID, LOG_DAEMON );
+
+    if ( port == 0 )
 	{
 #ifdef USE_SSL
 	if ( do_ssl )
@@ -290,12 +444,13 @@ main( int argc, char** argv )
 #endif /* USE_SSL */
 	}
 
+    /* Log file. */
     if ( logfile != (char*) 0 )
 	{
-	/* Open the log file. */
 	logfp = fopen( logfile, "a" );
 	if ( logfp == (FILE*) 0 )
 	    {
+	    syslog( LOG_CRIT, "%s - %m", logfile );
 	    perror( logfile );
 	    exit( 1 );
 	    }
@@ -312,13 +467,14 @@ main( int argc, char** argv )
 	}
     if ( ! ( gotv4 || gotv6 ) )
 	{
-	(void) fprintf( stderr, "can't find any valid address\n" );
+	syslog( LOG_CRIT, "can't find any valid address" );
+	(void) fprintf( stderr, "%s: can't find any valid address\n", argv0 );
 	exit( 1 );
 	}
 
-    /* Initialize listen sockets.  Try v6 first because of a Linux peculiarity; 
-    ** unlike other systems, it has magical v6 sockets that also listen for v4,
-    ** but if you bind a v4 socket first then the v6 bind fails.
+    /* Initialize listen sockets.  Try v6 first because of a Linux peculiarity;
+    ** like some other systems, it has magical v6 sockets that also listen for
+    ** v4, but in Linux if you bind a v4 socket first then the v6 bind fails.
     */
     if ( gotv6 )
 	listen6_fd = initialize_listen_socket( &host_addr6 );
@@ -331,22 +487,32 @@ main( int argc, char** argv )
     /* If we didn't get any valid sockets, fail. */
     if ( listen4_fd == -1 && listen6_fd == -1 )
 	{
-	(void) fprintf( stderr, "can't bind to any address\n" );
+	syslog( LOG_CRIT, "can't bind to any address" );
+	(void) fprintf( stderr, "%s: can't bind to any address\n", argv0 );
 	exit( 1 );
 	}
 
 #ifdef USE_SSL
     if ( do_ssl )
 	{
-	SSLeay_add_ssl_algorithms();
 	SSL_load_error_strings();
+	SSLeay_add_ssl_algorithms();
 	ssl_ctx = SSL_CTX_new( SSLv23_server_method() );
-	if ( SSL_CTX_use_certificate_file( ssl_ctx, CERT_FILE, SSL_FILETYPE_PEM ) == 0 ||
-	     SSL_CTX_use_PrivateKey_file( ssl_ctx, KEY_FILE, SSL_FILETYPE_PEM ) == 0 ||
-	     SSL_CTX_check_private_key( ssl_ctx ) == 0 )
+	if ( certfile[0] != '\0' )
+	    if ( SSL_CTX_use_certificate_file( ssl_ctx, certfile, SSL_FILETYPE_PEM ) == 0 ||
+		 SSL_CTX_use_PrivateKey_file( ssl_ctx, certfile, SSL_FILETYPE_PEM ) == 0 ||
+		 SSL_CTX_check_private_key( ssl_ctx ) == 0 )
+		{
+		ERR_print_errors_fp( stderr );
+		exit( 1 );
+		}
+	if ( cipher != (char*) 0 )
 	    {
-	    ERR_print_errors_fp( stderr );
-	    exit( 1 );
+	    if ( SSL_CTX_set_cipher_list( ssl_ctx, cipher ) == 0 )
+		{
+		ERR_print_errors_fp( stderr );
+		exit( 1 );
+		}
 	    }
 	}
 #endif /* USE_SSL */
@@ -357,6 +523,7 @@ main( int argc, char** argv )
 #ifdef HAVE_DAEMON
 	if ( daemon( 1, 1 ) < 0 )
 	    {
+	    syslog( LOG_CRIT, "daemon - %m" );
 	    perror( "daemon" );
 	    exit( 1 );
 	    }
@@ -366,6 +533,7 @@ main( int argc, char** argv )
 	    case 0:
 	    break;
 	    case -1:
+	    syslog( LOG_CRIT, "fork - %m" );
 	    perror( "fork" );
 	    exit( 1 );
 	    default:
@@ -392,6 +560,7 @@ main( int argc, char** argv )
 	FILE* pidfp = fopen( pidfile, "w" );
         if ( pidfp == (FILE*) 0 )
             {
+	    syslog( LOG_CRIT, "%s - %m", pidfile );
 	    perror( pidfile );
             exit( 1 );
             }
@@ -409,24 +578,30 @@ main( int argc, char** argv )
 	pwd = getpwnam( user );
 	if ( pwd == (struct passwd*) 0 )
 	    {
+	    syslog( LOG_CRIT, "unknown user - '%s'", user );
 	    (void) fprintf( stderr, "%s: unknown user - '%s'\n", argv0, user );
 	    exit( 1 );
 	    }
 	/* Set aux groups to null. */
-	if ( setgroups( 0, (const gid_t*) 0 ) < 0 )
+	if ( setgroups( 0, (gid_t*) 0 ) < 0 )
 	    {
+	    syslog( LOG_CRIT, "setgroups - %m" );
 	    perror( "setgroups" );
 	    exit( 1 );
 	    }
 	/* Set primary group. */
 	if ( setgid( pwd->pw_gid ) < 0 )
 	    {
+	    syslog( LOG_CRIT, "setgid - %m" );
 	    perror( "setgid" );
 	    exit( 1 );
 	    }
 	/* Try setting aux groups correctly - not critical if this fails. */
 	if ( initgroups( user, pwd->pw_gid ) < 0 )
+	    {
+	    syslog( LOG_ERR, "initgroups - %m" );
 	    perror( "initgroups" );
+	    }
 #ifdef HAVE_SETLOGIN
 	/* Set login name. */
 	(void) setlogin( user );
@@ -435,23 +610,51 @@ main( int argc, char** argv )
 	uid = pwd->pw_uid;
 	}
 
+    /* Switch directories if requested. */
+    if ( dir != (char*) 0 )
+	{
+	if ( chdir( dir ) < 0 )
+	    {
+	    syslog( LOG_CRIT, "chdir - %m" );
+	    perror( "chdir" );
+	    exit( 1 );
+	    }
+	}
+
+    /* Get current directory. */
+    (void) getcwd( cwd, sizeof(cwd) - 1 );
+    if ( cwd[strlen( cwd ) - 1] != '/' )
+	(void) strcat( cwd, "/" );
+
     /* Chroot if requested. */
     if ( do_chroot )
 	{
-	char cwd[1000];
-	(void) getcwd( cwd, sizeof(cwd) - 1 );
 	if ( chroot( cwd ) < 0 )
 	    {
+	    syslog( LOG_CRIT, "chroot - %m" );
 	    perror( "chroot" );
 	    exit( 1 );
 	    }
+	(void) strcpy( cwd, "/" );
 	/* Always chdir to / after a chroot. */
-	if ( chdir( "/" ) < 0 )
+	if ( chdir( cwd ) < 0 )
 	    {
+	    syslog( LOG_CRIT, "chroot chdir - %m" );
 	    perror( "chroot chdir" );
 	    exit( 1 );
 	    }
 
+	}
+
+    /* Switch directories again if requested. */
+    if ( data_dir != (char*) 0 )
+	{
+	if ( chdir( data_dir ) < 0 )
+	    {
+	    syslog( LOG_CRIT, "data_dir chdir - %m" );
+	    perror( "data_dir chdir" );
+	    exit( 1 );
+	    }
 	}
 
     /* If we're root, become someone else. */
@@ -460,48 +663,72 @@ main( int argc, char** argv )
 	/* Set uid. */
 	if ( setuid( uid ) < 0 )
 	    {
+	    syslog( LOG_CRIT, "setuid - %m" );
 	    perror( "setuid" );
 	    exit( 1 );
 	    }
 	/* Check for unnecessary security exposure. */
 	if ( ! do_chroot )
+	    {
+	    syslog( LOG_WARNING,
+		"started as root without requesting chroot(), warning only" );
 	    (void) fprintf( stderr,
 		"%s: started as root without requesting chroot(), warning only\n", argv0 );
+	    }
 	}
 
-    /* Catch various termination signals. */
+    /* Catch various signals. */
+#ifdef HAVE_SIGSET
+    (void) sigset( SIGTERM, handle_sigterm );
+    (void) sigset( SIGINT, handle_sigterm );
+    (void) sigset( SIGHUP, handle_sigterm );
+    (void) sigset( SIGUSR1, handle_sigterm );
+    (void) sigset( SIGCHLD, handle_sigchld );
+    (void) sigset( SIGPIPE, SIG_IGN );
+#else /* HAVE_SIGSET */
     (void) signal( SIGTERM, handle_sigterm );
     (void) signal( SIGINT, handle_sigterm );
     (void) signal( SIGHUP, handle_sigterm );
     (void) signal( SIGUSR1, handle_sigterm );
-
-    /* Catch defunct children. */
     (void) signal( SIGCHLD, handle_sigchld );
-
-    /* And get EPIPE instead of SIGPIPE. */
     (void) signal( SIGPIPE, SIG_IGN );
+#endif /* HAVE_SIGSET */
+
+    init_mime();
+
+    if ( hostname == (char*) 0 )
+	syslog(
+	    LOG_NOTICE, "%.80s starting on port %d", SERVER_SOFTWARE,
+	    (int) port );
+    else
+	syslog(
+	    LOG_NOTICE, "%.80s starting on %.80s, port %d", SERVER_SOFTWARE,
+	    hostname, (int) port );
 
     /* Main loop. */
     for (;;)
 	{
 	/* Possibly do a select() on the possible two listen fds. */
-	FD_ZERO( &afdset );
+	FD_ZERO( &lfdset );
 	maxfd = -1;
 	if ( listen4_fd != -1 )
 	    {
-	    FD_SET( listen4_fd, &afdset );
+	    FD_SET( listen4_fd, &lfdset );
 	    if ( listen4_fd > maxfd )
 		maxfd = listen4_fd;
 	    }
 	if ( listen6_fd != -1 )
 	    {
-	    FD_SET( listen6_fd, &afdset );
+	    FD_SET( listen6_fd, &lfdset );
 	    if ( listen6_fd > maxfd )
 		maxfd = listen6_fd;
 	    }
 	if ( listen4_fd != -1 && listen6_fd != -1 )
-	    if ( select( maxfd + 1, &afdset, (fd_set*) 0, (fd_set*) 0, (struct timeval*) 0 ) < 0 )
+	    if ( select( maxfd + 1, &lfdset, (fd_set*) 0, (fd_set*) 0, (struct timeval*) 0 ) < 0 )
 		{
+		if ( errno == EINTR )
+		    continue;	/* try again */
+		syslog( LOG_CRIT, "select - %m" );
 		perror( "select" );
 		exit( 1 );
 		}
@@ -512,12 +739,13 @@ main( int argc, char** argv )
 
 	/* Accept the new connection. */
 	sz = sizeof(usa);
-	if ( listen4_fd != -1 && FD_ISSET( listen4_fd, &afdset ) )
+	if ( listen4_fd != -1 && FD_ISSET( listen4_fd, &lfdset ) )
 	    conn_fd = accept( listen4_fd, &usa.sa, &sz );
-	else if ( listen6_fd != -1 && FD_ISSET( listen6_fd, &afdset ) )
+	else if ( listen6_fd != -1 && FD_ISSET( listen6_fd, &lfdset ) )
 	    conn_fd = accept( listen6_fd, &usa.sa, &sz );
 	else
 	    {
+	    syslog( LOG_CRIT, "select failure" );
 	    (void) fprintf( stderr, "%s: select failure\n", argv0 );
 	    exit( 1 );
 	    }
@@ -525,6 +753,11 @@ main( int argc, char** argv )
 	    {
 	    if ( errno == EINTR )
 		continue;	/* try again */
+#ifdef EPROTO
+	    if ( errno == EPROTO )
+		continue;	/* try again */
+#endif /* EPROTO */
+	    syslog( LOG_CRIT, "accept - %m" );
 	    perror( "accept" );
 	    exit( 1 );
 	    }
@@ -533,6 +766,7 @@ main( int argc, char** argv )
 	r = fork();
 	if ( r < 0 )
 	    {
+	    syslog( LOG_CRIT, "fork - %m" );
 	    perror( "fork" );
 	    exit( 1 );
 	    }
@@ -556,11 +790,202 @@ static void
 usage( void )
     {
 #ifdef USE_SSL
-    (void) fprintf( stderr, "usage:  %s [-D] [-S] [-p port] [-c cgipat] [-u user] [-h hostname] [-r] [-v] [-l logfile] [-i pidfile] [-T charset]\n", argv0 );
+    (void) fprintf( stderr, "usage:  %s [-C configfile] [-D] [-S] [-E certfile] [-Y cipher] [-p port] [-d dir] [-dd data_dir] [-c cgipat] [-u user] [-h hostname] [-r] [-v] [-l logfile] [-i pidfile] [-T charset] [-P P3P] [-M maxage]\n", argv0 );
 #else /* USE_SSL */
-    (void) fprintf( stderr, "usage:  %s [-D] [-p port] [-c cgipat] [-u user] [-h hostname] [-r] [-v] [-l logfile] [-i pidfile] [-T charset]\n", argv0 );
+    (void) fprintf( stderr, "usage:  %s [-C configfile] [-D] [-p port] [-d dir] [-dd data_dir] [-c cgipat] [-u user] [-h hostname] [-r] [-v] [-l logfile] [-i pidfile] [-T charset] [-P P3P] [-M maxage]\n", argv0 );
 #endif /* USE_SSL */
     exit( 1 );
+    }
+
+
+static void
+read_config( char* filename )
+    {
+    FILE* fp;
+    char line[10000];
+    char* cp;
+    char* cp2;
+    char* name;
+    char* value;
+
+    fp = fopen( filename, "r" );
+    if ( fp == (FILE*) 0 )
+	{
+	syslog( LOG_CRIT, "%s - %m", filename );
+	perror( filename );
+	exit( 1 );
+	}
+
+    while ( fgets( line, sizeof(line), fp ) != (char*) 0 )
+	{
+	/* Trim comments. */
+	if ( ( cp = strchr( line, '#' ) ) != (char*) 0 )
+	    *cp = '\0';
+
+	/* Skip leading whitespace. */
+	cp = line;
+	cp += strspn( cp, " \t\012\015" );
+
+	/* Split line into words. */
+	while ( *cp != '\0' )
+	    {
+	    /* Find next whitespace. */
+	    cp2 = cp + strcspn( cp, " \t\012\015" );
+	    /* Insert EOS and advance next-word pointer. */
+	    while ( *cp2 == ' ' || *cp2 == '\t' || *cp2 == '\012' || *cp2 == '\015' )
+		*cp2++ = '\0';
+	    /* Split into name and value. */
+	    name = cp;
+	    value = strchr( name, '=' );
+	    if ( value != (char*) 0 )
+		*value++ = '\0';
+	    /* Interpret. */
+	    if ( strcasecmp( name, "debug" ) == 0 )
+		{
+		no_value_required( name, value );
+		debug = 1;
+		}
+	    else if ( strcasecmp( name, "port" ) == 0 )
+		{
+		value_required( name, value );
+		port = (unsigned short) atoi( value );
+		}
+	    else if ( strcasecmp( name, "dir" ) == 0 )
+		{
+		value_required( name, value );
+		dir = e_strdup( value );
+		}
+	    else if ( strcasecmp( name, "data_dir" ) == 0 )
+		{
+		value_required( name, value );
+		data_dir = e_strdup( value );
+		}
+	    else if ( strcasecmp( name, "chroot" ) == 0 )
+		{
+		no_value_required( name, value );
+		do_chroot = 1;
+		}
+	    else if ( strcasecmp( name, "nochroot" ) == 0 )
+		{
+		no_value_required( name, value );
+		do_chroot = 0;
+		}
+	    else if ( strcasecmp( name, "user" ) == 0 )
+		{
+		value_required( name, value );
+		user = e_strdup( value );
+		}
+	    else if ( strcasecmp( name, "cgipat" ) == 0 )
+		{
+		value_required( name, value );
+		cgi_pattern = e_strdup( value );
+		}
+	    else if ( strcasecmp( name, "urlpat" ) == 0 )
+		{
+		value_required( name, value );
+		url_pattern = e_strdup( value );
+		}
+	    else if ( strcasecmp( name, "noemptyreferers" ) == 0 )
+		{
+		value_required( name, value );
+		no_empty_referers = 1;
+		}
+	    else if ( strcasecmp( name, "localpat" ) == 0 )
+		{
+		value_required( name, value );
+		local_pattern = e_strdup( value );
+		}
+	    else if ( strcasecmp( name, "host" ) == 0 )
+		{
+		value_required( name, value );
+		hostname = e_strdup( value );
+		}
+	    else if ( strcasecmp( name, "logfile" ) == 0 )
+		{
+		value_required( name, value );
+		logfile = e_strdup( value );
+		}
+	    else if ( strcasecmp( name, "vhost" ) == 0 )
+		{
+		no_value_required( name, value );
+		vhost = 1;
+		}
+	    else if ( strcasecmp( name, "pidfile" ) == 0 )
+		{
+		value_required( name, value );
+		pidfile = e_strdup( value );
+		}
+	    else if ( strcasecmp( name, "charset" ) == 0 )
+		{
+		value_required( name, value );
+		charset = e_strdup( value );
+		}
+	    else if ( strcasecmp( name, "p3p" ) == 0 )
+		{
+		value_required( name, value );
+		p3p = e_strdup( value );
+		}
+	    else if ( strcasecmp( name, "max_age" ) == 0 )
+		{
+		value_required( name, value );
+		max_age = atoi( value );
+		}
+#ifdef USE_SSL
+	    else if ( strcasecmp( name, "ssl" ) == 0 )
+		{
+		no_value_required( name, value );
+		do_ssl = 1;
+		}
+	    else if ( strcasecmp( name, "certfile" ) == 0 )
+		{
+		value_required( name, value );
+		certfile = e_strdup( value );
+		}
+	    else if ( strcasecmp( name, "cipher" ) == 0 )
+		{
+		value_required( name, value );
+		cipher = e_strdup( value );
+		}
+#endif /* USE_SSL */
+	    else
+		{
+		(void) fprintf(
+		    stderr, "%s: unknown config option '%s'\n", argv0, name );
+		exit( 1 );
+		}
+
+	    /* Advance to next word. */
+	    cp = cp2;
+	    cp += strspn( cp, " \t\012\015" );
+	    }
+	}
+
+    (void) fclose( fp );
+    }
+
+
+static void
+value_required( char* name, char* value )
+    {
+    if ( value == (char*) 0 )
+	{
+	(void) fprintf(
+	    stderr, "%s: value required for %s option\n", argv0, name );
+	exit( 1 );
+	}
+    }
+
+
+static void
+no_value_required( char* name, char* value )
+    {
+    if ( value != (char*) 0 )
+	{
+	(void) fprintf(
+	    stderr, "%s: no value required for %s option\n",
+	    argv0, name );
+	exit( 1 );
+	}
     }
 
 
@@ -573,15 +998,19 @@ initialize_listen_socket( usockaddr* usaP )
     /* Check sockaddr. */
     if ( ! sockaddr_check( usaP ) )
 	{
-	(void) fprintf(
-	    stderr, "unknown sockaddr family on listen socket - %d\n",
+	syslog(
+	    LOG_ERR, "unknown sockaddr family on listen socket - %d",
 	    usaP->sa.sa_family );
+	(void) fprintf(
+	    stderr, "%s: unknown sockaddr family on listen socket - %d\n",
+	    argv0, usaP->sa.sa_family );
 	return -1;
 	}
 
     listen_fd = socket( usaP->sa.sa_family, SOCK_STREAM, 0 );
     if ( listen_fd < 0 )
 	{
+	syslog( LOG_CRIT, "socket %.80s - %m", ntoa( usaP ) );
 	perror( "socket" );
 	return -1;
 	}
@@ -589,9 +1018,24 @@ initialize_listen_socket( usockaddr* usaP )
     (void) fcntl( listen_fd, F_SETFD, 1 );
 
     i = 1;
-    if ( setsockopt( listen_fd, SOL_SOCKET, SO_REUSEADDR, (char*) &i, sizeof(i) ) < 0 )
+    if ( setsockopt( listen_fd, SOL_SOCKET, SO_REUSEADDR, (void*) &i, sizeof(i) ) < 0 )
 	{
+	syslog( LOG_CRIT, "setsockopt SO_REUSEADDR - %m" );
 	perror( "setsockopt SO_REUSEADDR" );
+	return -1;
+	}
+
+    if ( bind( listen_fd, &usaP->sa, sockaddr_len( usaP ) ) < 0 )
+	{
+	syslog( LOG_CRIT, "bind %.80s - %m", ntoa( usaP ) );
+	perror( "bind" );
+	return -1;
+	}
+
+    if ( listen( listen_fd, 1024 ) < 0 )
+	{
+	syslog( LOG_CRIT, "listen - %m" );
+	perror( "listen" );
 	return -1;
 	}
 
@@ -603,18 +1047,6 @@ initialize_listen_socket( usockaddr* usaP )
     (void) setsockopt( listen_fd, SOL_SOCKET, SO_ACCEPTFILTER, (char*) &af, sizeof(af) );
     }
 #endif /* HAVE_ACCEPT_FILTERS */
-
-    if ( bind( listen_fd, &usaP->sa, sockaddr_len( usaP ) ) < 0 )
-	{
-	perror( "bind" );
-	return -1;
-	}
-
-    if ( listen( listen_fd, 1024 ) < 0 )
-	{
-	perror( "listen" );
-	return -1;
-	}
 
     return listen_fd;
     }
@@ -629,14 +1061,27 @@ handle_request( void )
     char* method_str;
     char* line;
     char* cp;
+    int r, file_len, i;
+    const char* index_names[] = {
+	"index.html", "index.htm", "index.xhtml", "index.xht", "Default.htm",
+	"index.cgi" };
+
+    /* Set up the timeout for reading. */
+#ifdef HAVE_SIGSET
+    (void) sigset( SIGALRM, handle_read_timeout );
+#else /* HAVE_SIGSET */
+    (void) signal( SIGALRM, handle_read_timeout );
+#endif /* HAVE_SIGSET */
+    (void) alarm( READ_TIMEOUT );
 
     /* Initialize the request variables. */
     remoteuser = (char*) 0;
-    method = -1;
+    method = METHOD_UNKNOWN;
     path = (char*) 0;
     file = (char*) 0;
+    pathinfo = (char*) 0;
     query = "";
-    protocol = "HTTP/1.0";
+    protocol = (char*) 0;
     status = 0;
     bytes = -1;
     req_hostname = (char*) 0;
@@ -649,6 +1094,17 @@ handle_request( void )
     if_modified_since = (time_t) -1;
     referer = "";
     useragent = "";
+
+#ifdef TCP_NOPUSH
+    /* Set the TCP_NOPUSH socket option, to try and avoid the 0.2 second
+    ** delay between sending the headers and sending the data.  A better
+    ** solution is writev() (as used in thttpd), or send the headers with
+    ** send(MSG_MORE) (only available in Linux so far).
+    */
+    r = 1;
+    (void) setsockopt(
+	conn_fd, IPPROTO_TCP, TCP_NOPUSH, (void*) &r, sizeof(r) );
+#endif /* TCP_NOPUSH */
 
 #ifdef USE_SSL
     if ( do_ssl )
@@ -671,23 +1127,27 @@ handle_request( void )
 	int r = my_read( buf, sizeof(buf) );
 	if ( r <= 0 )
 	    break;
+	(void) alarm( READ_TIMEOUT );
 	add_to_request( buf, r );
-	if ( strstr( request, "\r\n\r\n" ) != (char*) 0 ||
-	     strstr( request, "\n\n" ) != (char*) 0 )
+	if ( strstr( request, "\015\012\015\012" ) != (char*) 0 ||
+	     strstr( request, "\012\012" ) != (char*) 0 )
 	    break;
 	}
 
     /* Parse the first line of the request. */
     method_str = get_request_line();
-    path = strpbrk( method_str, " \t\n\r" );
+    if ( method_str == (char*) 0 )
+	send_error( 400, "Bad Request", "", "Can't parse request." );
+    path = strpbrk( method_str, " \t\012\015" );
     if ( path == (char*) 0 )
-	send_error( 400, "Bad Request", (char*) 0, "Can't parse request." );
+	send_error( 400, "Bad Request", "", "Can't parse request." );
     *path++ = '\0';
-    path += strspn( path, " \t\n\r" );
-    protocol = strpbrk( path, " \t\n\r" );
+    path += strspn( path, " \t\012\015" );
+    protocol = strpbrk( path, " \t\012\015" );
     if ( protocol == (char*) 0 )
-	send_error( 400, "Bad Request", (char*) 0, "Can't parse request." );
+	send_error( 400, "Bad Request", "", "Can't parse request." );
     *protocol++ = '\0';
+    protocol += strspn( protocol, " \t\012\015" );
     query = strchr( path, '?' );
     if ( query == (char*) 0 )
 	query = "";
@@ -728,6 +1188,8 @@ handle_request( void )
 	    cp = &line[5];
 	    cp += strspn( cp, " \t" );
 	    host = cp;
+	    if ( strchr( host, '/' ) != (char*) 0 )
+		send_error( 400, "Bad Request", "", "Can't parse request." );
 	    }
 	else if ( strncasecmp( line, "If-Modified-Since:", 18 ) == 0 )
 	    {
@@ -756,61 +1218,80 @@ handle_request( void )
     else if ( strcasecmp( method_str, get_method_str( METHOD_POST ) ) == 0 )
 	method = METHOD_POST;
     else
-	send_error( 501, "Not Implemented", (char*) 0, "That method is not implemented." );
+	send_error( 501, "Not Implemented", "", "That method is not implemented." );
 
     strdecode( path, path );
     if ( path[0] != '/' )
-	send_error( 400, "Bad Request", (char*) 0, "Bad filename." );
+	send_error( 400, "Bad Request", "", "Bad filename." );
     file = &(path[1]);
+    de_dotdot( file );
     if ( file[0] == '\0' )
 	file = "./";
-    de_dotdot( file );
     if ( file[0] == '/' ||
 	 ( file[0] == '.' && file[1] == '.' &&
 	   ( file[2] == '\0' || file[2] == '/' ) ) )
-	send_error( 400, "Bad Request", (char*) 0, "Illegal filename." );
+	send_error( 400, "Bad Request", "", "Illegal filename." );
     if ( vhost )
 	file = virtual_file( file );
 
-    if ( stat( file, &sb ) < 0 )
-	send_error( 404, "Not Found", (char*) 0, "File not found." );
+    /* Set up the timeout for writing. */
+#ifdef HAVE_SIGSET
+    (void) sigset( SIGALRM, handle_write_timeout );
+#else /* HAVE_SIGSET */
+    (void) signal( SIGALRM, handle_write_timeout );
+#endif /* HAVE_SIGSET */
+    (void) alarm( WRITE_TIMEOUT );
+
+    r = stat( file, &sb );
+    if ( r < 0 )
+	r = get_pathinfo();
+    if ( r < 0 )
+	send_error( 404, "Not Found", "", "File not found." );
+    file_len = strlen( file );
     if ( ! S_ISDIR( sb.st_mode ) )
+	{
+	/* Not a directory. */
+	while ( file[file_len - 1] == '/' )
+	    {
+	    file[file_len - 1] = '\0';
+	    --file_len;
+	    }
 	do_file();
+	}
     else
 	{
 	char idx[10000];
-	if ( file[strlen(file) - 1] != '/' )
+
+	/* The filename is a directory.  Is it missing the trailing slash? */
+	if ( file[file_len - 1] != '/' && pathinfo == (char*) 0 )
 	    {
 	    char location[10000];
-	    (void) snprintf( location, sizeof(location), "Location: %s/", path );
+	    if ( query[0] != '\0' )
+		(void) snprintf(
+		    location, sizeof(location), "Location: %s/?%s", path,
+		    query );
+	    else
+		(void) snprintf(
+		    location, sizeof(location), "Location: %s/", path );
 	    send_error( 302, "Found", location, "Directories must end with a slash." );
 	    }
-	(void) snprintf( idx, sizeof(idx), "%sindex.html", file );
-	if ( stat( idx, &sb ) >= 0 )
+
+	/* Check for an index file. */
+	for ( i = 0; i < sizeof(index_names) / sizeof(char*); ++i )
 	    {
-	    file = idx;
-	    do_file();
-	    }
-	else
-	    {
-	    (void) snprintf( idx, sizeof(idx), "%sindex.htm", file );
+	    (void) snprintf( idx, sizeof(idx), "%s%s", file, index_names[i] );
 	    if ( stat( idx, &sb ) >= 0 )
 		{
 		file = idx;
 		do_file();
-		}
-	    else
-		{
-		(void) snprintf( idx, sizeof(idx), "%sindex.cgi", file );
-		if ( stat( idx, &sb ) >= 0 )
-		    {
-		    file = idx;
-		    do_file();
-		    }
-		else
-		    do_dir();
+		goto got_one;
 		}
 	    }
+
+	/* Nope, no index file, so it's an actual directory request. */
+	do_dir();
+
+	got_one: ;
 	}
 
 #ifdef USE_SSL
@@ -826,14 +1307,31 @@ de_dotdot( char* file )
     char* cp2;
     int l;
 
-    /* Elide any xxx/../ sequences. */
-    while ( ( cp = strstr( file, "/../" ) ) != (char*) 0 )
+    /* Collapse any multiple / sequences. */
+    while ( ( cp = strstr( file, "//") ) != (char*) 0 )
 	{
+	for ( cp2 = cp + 2; *cp2 == '/'; ++cp2 )
+	    continue;
+	(void) strcpy( cp + 1, cp2 );
+	}
+
+    /* Remove leading ./ and any /./ sequences. */
+    while ( strncmp( file, "./", 2 ) == 0 )
+	(void) strcpy( file, file + 2 );
+    while ( ( cp = strstr( file, "/./") ) != (char*) 0 )
+	(void) strcpy( cp, cp + 2 );
+
+    /* Alternate between removing leading ../ and removing xxx/../ */
+    for (;;)
+	{
+	while ( strncmp( file, "../", 3 ) == 0 )
+	    (void) strcpy( file, file + 3 );
+	cp = strstr( file, "/../" );
+	if ( cp == (char*) 0 )
+	    break;
 	for ( cp2 = cp - 1; cp2 >= file && *cp2 != '/'; --cp2 )
 	    continue;
-	if ( cp2 < file )
-	    break;
-	(void) strcpy( cp2, cp + 3 );
+	(void) strcpy( cp2 + 1, cp + 4 );
 	}
 
     /* Also elide any xxx/.. at the end. */
@@ -849,15 +1347,46 @@ de_dotdot( char* file )
     }
 
 
+static int
+get_pathinfo( void )
+    {
+    int r;
+
+    pathinfo = &file[strlen(file)];
+    for (;;)
+	{
+	do
+	    {
+	    --pathinfo;
+	    if ( pathinfo <= file )
+		{
+		pathinfo = (char*) 0;
+		return -1;
+		}
+	    }
+	while ( *pathinfo != '/' );
+	*pathinfo = '\0';
+	r = stat( file, &sb );
+	if ( r >= 0 )
+	    {
+	    ++pathinfo;
+	    return r;
+	    }
+	else
+	    *pathinfo = '/';
+	}
+    }
+
+
 static void
 do_file( void )
     {
     char buf[10000];
-    char* type;
-    char fixed_type[500];
+    char mime_encodings[500];
+    char* mime_type;
+    char fixed_mime_type[500];
     char* cp;
     int fd;
-    void* ptr;
 
     /* Check authorization for this directory. */
     (void) strncpy( buf, file, sizeof(buf) );
@@ -872,7 +1401,15 @@ do_file( void )
     if ( strcmp( file, AUTH_FILE ) == 0 ||
 	 ( strcmp( &(file[strlen(file) - sizeof(AUTH_FILE) + 1]), AUTH_FILE ) == 0 &&
 	   file[strlen(file) - sizeof(AUTH_FILE)] == '/' ) )
-	send_error( 403, "Forbidden", (char*) 0, "File is protected." );
+	{
+	syslog(
+	    LOG_NOTICE, "%.80s URL \"%.80s\" tried to retrieve an auth file",
+	    ntoa( &client_addr ), path );
+	send_error( 403, "Forbidden", "", "File is protected." );
+	}
+
+    /* Referer check. */
+    check_referer();
 
     /* Is it CGI? */
     if ( cgi_pattern != (char*) 0 && match( cgi_pattern, file ) )
@@ -880,22 +1417,32 @@ do_file( void )
 	do_cgi();
 	return;
 	}
+    else if ( pathinfo != (char*) 0 )
+	send_error( 404, "Not Found", "", "File not found." );
 
     fd = open( file, O_RDONLY );
     if ( fd < 0 )
-	send_error( 403, "Forbidden", (char*) 0, "File is protected." );
-    type = get_mime_type( file );
-    (void) snprintf( fixed_type, sizeof(fixed_type), type, charset );
+	{
+	syslog(
+	    LOG_INFO, "%.80s File \"%.80s\" is protected",
+	    ntoa( &client_addr ), path );
+	send_error( 403, "Forbidden", "", "File is protected." );
+	}
+    mime_type = figure_mime( file, mime_encodings, sizeof(mime_encodings) );
+    (void) snprintf(
+	fixed_mime_type, sizeof(fixed_mime_type), mime_type, charset );
     if ( if_modified_since != (time_t) -1 &&
 	 if_modified_since >= sb.st_mtime )
 	{
 	add_headers(
-	    304, "Not Modified", (char*) 0, fixed_type, sb.st_size,
-	    sb.st_mtime );
+	    304, "Not Modified", "", mime_encodings, fixed_mime_type,
+	    (off_t) -1, sb.st_mtime );
 	send_response();
 	return;
 	}
-    add_headers( 200, "Ok", (char*) 0, fixed_type, sb.st_size, sb.st_mtime );
+    add_headers(
+	200, "Ok", "", mime_encodings, fixed_mime_type, sb.st_size,
+	sb.st_mtime );
     send_response();
     if ( method == METHOD_HEAD )
 	return;
@@ -905,29 +1452,17 @@ do_file( void )
 #ifdef HAVE_SENDFILE
 
 #ifndef USE_SSL
-	(void) sendfile( fd, conn_fd, 0, 0, 0, 0, 0 );
+	(void) my_sendfile( fd, conn_fd, 0, sb.st_size );
 #else /* USE_SSL */
-	if ( ! do_ssl )
-	    (void) sendfile( fd, conn_fd, 0, 0, 0, 0, 0 );
+	if ( do_ssl )
+	    send_via_write( fd, sb.st_size );
 	else
-	    {
-	    ptr = mmap( 0, sb.st_size, PROT_READ, MAP_SHARED, fd, 0 );
-	    if ( ptr != (void*) -1 )
-		{
-		(void) my_write( ptr, sb.st_size );
-		(void) munmap( ptr, sb.st_size );
-		}
-	    }
+	    (void) my_sendfile( fd, conn_fd, 0, sb.st_size );
 #endif /* USE_SSL */
 
 #else /* HAVE_SENDFILE */
 
-	ptr = mmap( 0, sb.st_size, PROT_READ, MAP_SHARED, fd, 0 );
-	if ( ptr != (void*) -1 )
-	    {
-	    (void) my_write( ptr, sb.st_size );
-	    (void) munmap( ptr, sb.st_size );
-	    }
+   	send_via_write( fd, sb.st_size );
 
 #endif /* HAVE_SENDFILE */
 	}
@@ -940,21 +1475,59 @@ static void
 do_dir( void )
     {
     char buf[10000];
-    int buflen;
-    char command[10000];
+    size_t buflen;
     char* contents;
-    int contents_size, contents_len;
+    size_t contents_size, contents_len;
+#ifdef HAVE_SCANDIR
+    int n, i;
+    struct dirent **dl;
+    char* name_info;
+#else /* HAVE_SCANDIR */
+    char command[10000];
     FILE* fp;
+#endif /* HAVE_SCANDIR */
+
+    if ( pathinfo != (char*) 0 )
+	send_error( 404, "Not Found", "", "File not found." );
 
     /* Check authorization for this directory. */
     auth_check( file );
 
+    /* Referer check. */
+    check_referer();
+
+#ifdef HAVE_SCANDIR
+    n = scandir( file, &dl, NULL, alphasort );
+    if ( n < 0 )
+	{
+	syslog(
+	    LOG_INFO, "%.80s Directory \"%.80s\" is protected",
+	    ntoa( &client_addr ), path );
+	send_error( 403, "Forbidden", "", "Directory is protected." );
+	}
+#endif /* HAVE_SCANDIR */
+
     contents_size = 0;
-    buflen = snprintf( buf, sizeof(buf),
-	"<HTML><HEAD><TITLE>Index of %s</TITLE></HEAD>\n<BODY BGCOLOR=\"#99cc99\"><H4>Index of %s</H4>\n<PRE>\n",
+    buflen = snprintf( buf, sizeof(buf), "\
+<HTML>\n\
+<HEAD><TITLE>Index of %s</TITLE></HEAD>\n\
+<BODY BGCOLOR=\"#99cc99\" TEXT=\"#000000\" LINK=\"#2020ff\" VLINK=\"#4040cc\">\n\
+<H4>Index of %s</H4>\n\
+<PRE>\n",
 	file, file );
     add_to_buf( &contents, &contents_size, &contents_len, buf, buflen );
 
+#ifdef HAVE_SCANDIR
+
+    for ( i = 0; i < n; ++i )
+	{
+	name_info = file_details( file, dl[i]->d_name );
+	add_to_buf(
+	    &contents, &contents_size, &contents_len, name_info,
+	    strlen( name_info ) );
+	}
+
+#else /* HAVE_SCANDIR */
     /* Magic HTML ls command! */
     if ( strchr( file, '\'' ) == (char*) 0 )
 	{
@@ -965,29 +1538,85 @@ do_dir( void )
 	fp = popen( command, "r" );
 	for (;;)
 	    {
-	    int r;
+	    size_t r;
 	    r = fread( buf, 1, sizeof(buf), fp );
-	    if ( r <= 0 )
+	    if ( r == 0 )
 		break;
 	    add_to_buf( &contents, &contents_size, &contents_len, buf, r );
 	    }
 	(void) pclose( fp );
 	}
+#endif /* HAVE_SCANDIR */
 
-    buflen = snprintf( buf, sizeof(buf),
-	"</PRE>\n<HR>\n<ADDRESS><A HREF=\"%s\">%s</A></ADDRESS>\n</BODY></HTML>\n",
+    buflen = snprintf( buf, sizeof(buf), "\
+</PRE>\n\
+<HR>\n\
+<ADDRESS><A HREF=\"%s\">%s</A></ADDRESS>\n\
+</BODY>\n\
+</HTML>\n",
 	SERVER_URL, SERVER_SOFTWARE );
     add_to_buf( &contents, &contents_size, &contents_len, buf, buflen );
 
-    add_headers( 200, "Ok", (char*) 0, "text/html", contents_len, sb.st_mtime );
-    if ( method == METHOD_HEAD )
-	{
-	send_response();
-	return;
-	}
-    add_to_response( contents, contents_len );
+    add_headers( 200, "Ok", "", "", "text/html", contents_len, sb.st_mtime );
+    if ( method != METHOD_HEAD )
+	add_to_response( contents, contents_len );
     send_response();
     }
+
+
+#ifdef HAVE_SCANDIR
+
+static char*
+file_details( const char* dir, const char* name )
+    {
+    struct stat sb;
+    char f_time[20];
+    static char encname[1000];
+    static char buf[2000];
+
+    (void) snprintf( buf, sizeof(buf), "%s/%s", dir, name );
+    if ( lstat( buf, &sb ) < 0 )
+	return "???";
+    (void) strftime( f_time, sizeof( f_time ), "%d%b%Y %H:%M", localtime( &sb.st_mtime ) );
+    strencode( encname, sizeof(encname), name );
+#ifdef HAVE_INT64T
+    (void) snprintf(
+	buf, sizeof( buf ), "<A HREF=\"%s\">%-32.32s</A>    %15s %14lld\n",
+	encname, name, f_time, (int64_t) sb.st_size );
+#else /* HAVE_INT64T */
+    (void) snprintf(
+	buf, sizeof( buf ), "<A HREF=\"%s\">%-32.32s</A>    %15s %14ld\n",
+	encname, name, f_time, (long) sb.st_size );
+#endif /* HAVE_INT64T */
+    return buf;
+    }
+
+
+/* Copies and encodes a string. */
+static void
+strencode( char* to, size_t tosize, const char* from )
+    {
+    int tolen;
+
+    for ( tolen = 0; *from != '\0' && tolen + 4 < tosize; ++from )
+	{
+	if ( isalnum(*from) || strchr( "/_.-~", *from ) != (char*) 0 )
+	    {
+	    *to = *from;
+	    ++to;
+	    ++tolen;
+	    }
+	else
+	    {
+	    (void) sprintf( to, "%%%02x", (int) *from & 0xff );
+	    to += 3;
+	    tolen += 3;
+	    }
+	}
+    *to = '\0';
+    }
+
+#endif /* HAVE_SCANDIR */
 
 
 static void
@@ -1000,7 +1629,24 @@ do_cgi( void )
     char* directory;
 
     if ( method != METHOD_GET && method != METHOD_POST )
-	send_error( 501, "Not Implemented", (char*) 0, "That method is not implemented for CGI." );
+	send_error( 501, "Not Implemented", "", "That method is not implemented for CGI." );
+
+    /* If the socket happens to be using one of the stdin/stdout/stderr
+    ** descriptors, move it to another descriptor so that the dup2 calls
+    ** below don't screw things up.  We arbitrarily pick fd 3 - if there
+    ** was already something on it, we clobber it, but that doesn't matter
+    ** since at this point the only fd of interest is the connection.
+    ** All others will be closed on exec.
+    */
+    if ( conn_fd == STDIN_FILENO || conn_fd == STDOUT_FILENO || conn_fd == STDERR_FILENO )
+	{
+	int newfd = dup2( conn_fd, STDERR_FILENO + 1 );
+	if ( newfd >= 0 )
+	    conn_fd = newfd;
+	/* If the dup2 fails, shrug.  We'll just take our chances.
+	** Shouldn't happen though.
+	*/
+	}
 
     /* Make the environment vector. */
     envp = make_envp();
@@ -1022,10 +1668,10 @@ do_cgi( void )
 	int r;
 
 	if ( pipe( p ) < 0 )
-	    send_error( 500, "Internal Error", (char*) 0, "Something unexpected went wrong making a pipe." );
+	    send_error( 500, "Internal Error", "", "Something unexpected went wrong making a pipe." );
 	r = fork();
 	if ( r < 0 )
-	    send_error( 500, "Internal Error", (char*) 0, "Something unexpected went wrong forking an interposer." );
+	    send_error( 500, "Internal Error", "", "Something unexpected went wrong forking an interposer." );
 	if ( r == 0 )
 	    {
 	    /* Interposer process. */
@@ -1034,13 +1680,17 @@ do_cgi( void )
 	    exit( 0 );
 	    }
 	(void) close( p[1] );
-	(void) dup2( p[0], STDIN_FILENO );
-	(void) close( p[0] );
+	if ( p[0] != STDIN_FILENO )
+	    {
+	    (void) dup2( p[0], STDIN_FILENO );
+	    (void) close( p[0] );
+	    }
 	}
     else
 	{
 	/* Otherwise, the request socket is stdin. */
-	(void) dup2( conn_fd, STDIN_FILENO );
+	if ( conn_fd != STDIN_FILENO )
+	    (void) dup2( conn_fd, STDIN_FILENO );
 	}
 
     /* Set up stdout/stderr.  For SSL, or if we're doing CGI header parsing,
@@ -1060,10 +1710,10 @@ do_cgi( void )
 	int r;
 
 	if ( pipe( p ) < 0 )
-	    send_error( 500, "Internal Error", (char*) 0, "Something unexpected went wrong making a pipe." );
+	    send_error( 500, "Internal Error", "", "Something unexpected went wrong making a pipe." );
 	r = fork();
 	if ( r < 0 )
-	    send_error( 500, "Internal Error", (char*) 0, "Something unexpected went wrong forking an interposer." );
+	    send_error( 500, "Internal Error", "", "Something unexpected went wrong forking an interposer." );
 	if ( r == 0 )
 	    {
 	    /* Interposer process. */
@@ -1072,15 +1722,20 @@ do_cgi( void )
 	    exit( 0 );
 	    }
 	(void) close( p[0] );
-	(void) dup2( p[1], STDOUT_FILENO );
-	(void) dup2( p[1], STDERR_FILENO );
-	(void) close( p[1] );
+	if ( p[1] != STDOUT_FILENO )
+	    (void) dup2( p[1], STDOUT_FILENO );
+	if ( p[1] != STDERR_FILENO )
+	    (void) dup2( p[1], STDERR_FILENO );
+	if ( p[1] != STDOUT_FILENO && p[1] != STDERR_FILENO )
+	    (void) close( p[1] );
 	}
     else
 	{
 	/* Otherwise, the request socket is stdout/stderr. */
-	(void) dup2( conn_fd, STDOUT_FILENO );
-	(void) dup2( conn_fd, STDERR_FILENO );
+	if ( conn_fd != STDOUT_FILENO )
+	    (void) dup2( conn_fd, STDOUT_FILENO );
+	if ( conn_fd != STDERR_FILENO )
+	    (void) dup2( conn_fd, STDERR_FILENO );
 	}
 
     /* At this point we would like to set conn_fd to be close-on-exec.
@@ -1094,6 +1749,13 @@ do_cgi( void )
     */
     /* (void) fcntl( conn_fd, F_SETFD, 1 ); */
 
+    /* Close the log file. */
+    if ( logfp != (FILE*) 0 )
+	(void) fclose( logfp );
+
+    /* Close syslog. */
+    closelog();
+
     /* Set priority. */
     (void) nice( CGI_NICE );
 
@@ -1101,29 +1763,28 @@ do_cgi( void )
     ** to the program's own directory.  This isn't in the CGI 1.1
     ** spec, but it's what other HTTP servers do.
     */
-    directory = strdup( file );
-    if ( directory == (char*) 0 )
-	binary = file;	/* ignore errors */
+    directory = e_strdup( file );
+    binary = strrchr( directory, '/' );
+    if ( binary == (char*) 0 )
+	binary = file;
     else
 	{
-	binary = strrchr( directory, '/' );
-	if ( binary == (char*) 0 )
-	    binary = file;
-	else
-	    {
-	    *binary++ = '\0';
-	    (void) chdir( directory );	/* ignore errors */
-	    }
+	*binary++ = '\0';
+	(void) chdir( directory );	/* ignore errors */
 	}
 
     /* Default behavior for SIGPIPE. */
+#ifdef HAVE_SIGSET
+    (void) sigset( SIGPIPE, SIG_DFL );
+#else /* HAVE_SIGSET */
     (void) signal( SIGPIPE, SIG_DFL );
+#endif /* HAVE_SIGSET */
 
     /* Run the program. */
     (void) execve( binary, argp, envp );
 
     /* Something went wrong. */
-    send_error( 500, "Internal Error", (char*) 0, "Something unexpected went wrong running a CGI program." );
+    send_error( 500, "Internal Error", "", "Something unexpected went wrong running a CGI program." );
     }
 
 
@@ -1138,7 +1799,8 @@ do_cgi( void )
 static void
 cgi_interpose_input( int wfd )
     {
-    int c, r;
+    size_t c;
+    ssize_t r;
     char buf[1024];
 
     c = request_len - request_idx;
@@ -1149,9 +1811,9 @@ cgi_interpose_input( int wfd )
 	}
     while ( c < content_length )
 	{
-	r = my_read( buf, MIN( sizeof(buf), content_length - c ) );
+	r = my_read( buf, min( sizeof(buf), content_length - c ) );
 	if ( r == 0 )
-	    sleep( 1 );
+	    return;
 	else if ( r < 0 )
 	    {
 	    if ( errno == EAGAIN )
@@ -1166,12 +1828,7 @@ cgi_interpose_input( int wfd )
 	    c += r;
 	    }
 	}
-#ifdef USE_SSL
-    if ( ! do_ssl )
-	post_post_garbage_hack();
-#else /* USE_SSL */
     post_post_garbage_hack();
-#endif /* USE_SSL */
     }
 
 
@@ -1186,10 +1843,18 @@ static void
 post_post_garbage_hack( void )
     {
     char buf[2];
-    int r;
+
+#ifdef USE_SSL
+    if ( do_ssl )
+	/* We don't need to do this for SSL, since the garbage has
+	** already been read.  Probably.
+	*/
+	return;
+#endif /* USE_SSL */
 
     set_ndelay( conn_fd );
     (void) read( conn_fd, buf, sizeof(buf) );
+    clear_ndelay( conn_fd );
     }
 
 
@@ -1197,7 +1862,7 @@ post_post_garbage_hack( void )
 static void
 cgi_interpose_output( int rfd, int parse_headers )
     {
-    int r;
+    ssize_t r;
     char buf[1024];
 
     if ( ! parse_headers )
@@ -1205,7 +1870,7 @@ cgi_interpose_output( int rfd, int parse_headers )
 	/* If we're not parsing headers, write out the default status line
 	** and proceed to the echo phase.
 	*/
-	char http_head[] = "HTTP/1.0 200 OK\r\n";
+	char http_head[] = "HTTP/1.0 200 OK\015\012";
 	(void) my_write( http_head, sizeof(http_head) );
 	}
     else
@@ -1218,7 +1883,7 @@ cgi_interpose_output( int rfd, int parse_headers )
 	** we write out the saved headers and proceed to echo the rest of
 	** the response.
 	*/
-	int headers_size, headers_len;
+	size_t headers_size, headers_len;
 	char* headers;
 	char* br;
 	int status;
@@ -1237,16 +1902,20 @@ cgi_interpose_output( int rfd, int parse_headers )
 		break;
 		}
 	    add_to_buf( &headers, &headers_size, &headers_len, buf, r );
-	    if ( ( br = strstr( headers, "\r\n\r\n" ) ) != (char*) 0 ||
-		 ( br = strstr( headers, "\n\n" ) ) != (char*) 0 )
+	    if ( ( br = strstr( headers, "\015\012\015\012" ) ) != (char*) 0 ||
+		 ( br = strstr( headers, "\012\012" ) ) != (char*) 0 )
 		break;
 	    }
+
+	/* If there were no headers, bail. */
+	if ( headers[0] == '\0' )
+	    return;
 
 	/* Figure out the status. */
 	status = 200;
 	if ( ( cp = strstr( headers, "Status:" ) ) != (char*) 0 &&
 	     cp < br &&
-	     ( cp == headers || *(cp-1) == '\n' ) )
+	     ( cp == headers || *(cp-1) == '\012' ) )
 	    {
 	    cp += 7;
 	    cp += strspn( cp, " \t" );
@@ -1254,7 +1923,7 @@ cgi_interpose_output( int rfd, int parse_headers )
 	    }
 	if ( ( cp = strstr( headers, "Location:" ) ) != (char*) 0 &&
 	     cp < br &&
-	     ( cp == headers || *(cp-1) == '\n' ) )
+	     ( cp == headers || *(cp-1) == '\012' ) )
 	    status = 302;
 
 	/* Write the status line. */
@@ -1274,7 +1943,7 @@ cgi_interpose_output( int rfd, int parse_headers )
 	    default: title = "Something"; break;
 	    }
 	(void) snprintf(
-	    buf, sizeof(buf), "HTTP/1.0 %d %s\r\n", status, title );
+	    buf, sizeof(buf), "HTTP/1.0 %d %s\015\012", status, title );
 	(void) my_write( buf, strlen( buf ) );
 
 	/* Write the saved headers. */
@@ -1286,10 +1955,11 @@ cgi_interpose_output( int rfd, int parse_headers )
 	{
 	r = read( rfd, buf, sizeof(buf) );
 	if ( r <= 0 )
-	    return;
+	    break;
 	if ( my_write( buf, r ) != r )
-	    return;
+	    break;
 	}
+    shutdown( conn_fd, SHUT_WR );
     }
 
 
@@ -1373,11 +2043,17 @@ make_envp( void )
 	envp[envn++] = build_env( "SERVER_NAME=%s", cp );
     envp[envn++] = "GATEWAY_INTERFACE=CGI/1.1";
     envp[envn++] = "SERVER_PROTOCOL=HTTP/1.0";
-    (void) snprintf( buf, sizeof(buf), "%d", port );
+    (void) snprintf( buf, sizeof(buf), "%d", (int) port );
     envp[envn++] = build_env( "SERVER_PORT=%s", buf );
     envp[envn++] = build_env(
 	"REQUEST_METHOD=%s", get_method_str( method ) );
     envp[envn++] = build_env( "SCRIPT_NAME=%s", path );
+    if ( pathinfo != (char*) 0 )
+	{
+	envp[envn++] = build_env( "PATH_INFO=/%s", pathinfo );
+	(void) snprintf( buf, sizeof(buf), "%s%s", cwd, pathinfo );
+	envp[envn++] = build_env( "PATH_TRANSLATED=%s", buf );
+	}
     if ( query[0] != '\0' )
 	envp[envn++] = build_env( "QUERY_STRING=%s", query );
     envp[envn++] = build_env( "REMOTE_ADDR=%s", ntoa( &client_addr ) );
@@ -1387,11 +2063,14 @@ make_envp( void )
 	envp[envn++] = build_env( "HTTP_USER_AGENT=%s", useragent );
     if ( cookie != (char*) 0 )
 	envp[envn++] = build_env( "HTTP_COOKIE=%s", cookie );
+    if ( host != (char*) 0 )
+	envp[envn++] = build_env( "HTTP_HOST=%s", host );
     if ( content_type != (char*) 0 )
 	envp[envn++] = build_env( "CONTENT_TYPE=%s", content_type );
     if ( content_length != -1 )
 	{
-	(void) snprintf( buf, sizeof(buf), "%ld", content_length );
+	(void) snprintf(
+	    buf, sizeof(buf), "%lu", (unsigned long) content_length );
 	envp[envn++] = build_env( "CONTENT_LENGTH=%s", buf );
 	}
     if ( remoteuser != (char*) 0 )
@@ -1420,26 +2099,16 @@ build_env( char* fmt, char* arg )
 	if ( maxbuf == 0 )
 	    {
 	    maxbuf = 256;
-	    buf = (char*) malloc( maxbuf );
+	    buf = (char*) e_malloc( maxbuf );
 	    }
 	else
 	    {
 	    maxbuf *= 2;
-	    buf = (char*) realloc( (void*) buf, maxbuf );
-	    }
-	if ( buf == (char*) 0 )
-	    {
-	    (void) fprintf( stderr, "%s: out of memory\n", argv0 );
-	    exit( 1 );
+	    buf = (char*) e_realloc( (void*) buf, maxbuf );
 	    }
 	}
     (void) snprintf( buf, maxbuf, fmt, arg );
-    cp = strdup( buf );
-    if ( cp == (char*) 0 )
-	{
-	(void) fprintf( stderr, "%s: out of memory\n", argv0 );
-	exit( 1 );
-	}
+    cp = e_strdup( buf );
     return cp;
     }
 
@@ -1451,6 +2120,7 @@ auth_check( char* dirname )
     struct stat sb;
     char authinfo[500];
     char* authpass;
+    char* colon;
     static char line[10000];
     int l;
     FILE* fp;
@@ -1477,7 +2147,8 @@ auth_check( char* dirname )
 	send_authenticate( dirname );
 
     /* Decode it. */
-    l = b64_decode( &(authorization[6]), authinfo, sizeof(authinfo) );
+    l = b64_decode(
+	&(authorization[6]), (unsigned char*) authinfo, sizeof(authinfo) - 1 );
     authinfo[l] = '\0';
     /* Split into user and password. */
     authpass = strchr( authinfo, ':' );
@@ -1485,12 +2156,21 @@ auth_check( char* dirname )
 	/* No colon?  Bogus auth info. */
 	send_authenticate( dirname );
     *authpass++ = '\0';
+    /* If there are more fields, cut them off. */
+    colon = strchr( authpass, ':' );
+    if ( colon != (char*) 0 )
+	*colon = '\0';
 
     /* Open the password file. */
     fp = fopen( authpath, "r" );
     if ( fp == (FILE*) 0 )
+	{
 	/* The file exists but we can't open it?  Disallow access. */
-	send_error( 403, "Forbidden", (char*) 0, "File is protected." );
+	syslog(
+	    LOG_ERR, "%.80s auth file %.80s could not be opened - %m",
+	    ntoa( &client_addr ), authpath );
+	send_error( 403, "Forbidden", "", "File is protected." );
+	}
 
     /* Read it. */
     while ( fgets( line, sizeof(line), fp ) != (char*) 0 )
@@ -1569,7 +2249,8 @@ virtual_file( char* file )
 static void
 send_error( int s, char* title, char* extra_header, char* text )
     {
-    add_headers( s, title, extra_header, "text/html", -1, -1 );
+    add_headers(
+	s, title, extra_header, "", "text/html", (off_t) -1, (time_t) -1 );
 
     send_error_body( s, title, text );
 
@@ -1609,8 +2290,11 @@ send_error_body( int s, char* title, char* text )
 
     /* Send built-in error page. */
     buflen = snprintf(
-	buf, sizeof(buf),
-	"<HTML><HEAD><TITLE>%d %s</TITLE></HEAD>\n<BODY BGCOLOR=\"#cc9999\"><H4>%d %s</H4>\n",
+	buf, sizeof(buf), "\
+<HTML>\n\
+<HEAD><TITLE>%d %s</TITLE></HEAD>\n\
+<BODY BGCOLOR=\"#cc9999\" TEXT=\"#000000\" LINK=\"#2020ff\" VLINK=\"#4040cc\">\n\
+<H4>%d %s</H4>\n",
 	s, title, s, title );
     add_to_response( buf, buflen );
     buflen = snprintf( buf, sizeof(buf), "%s\n", text );
@@ -1623,7 +2307,7 @@ send_error_file( char* filename )
     {
     FILE* fp;
     char buf[1000];
-    int r;
+    size_t r;
 
     fp = fopen( filename, "r" );
     if ( fp == (FILE*) 0 )
@@ -1631,7 +2315,7 @@ send_error_file( char* filename )
     for (;;)
 	{
 	r = fread( buf, 1, sizeof(buf), fp );
-	if ( r <= 0 )
+	if ( r == 0 )
 	    break;
 	add_to_response( buf, r );
 	}
@@ -1660,15 +2344,20 @@ send_error_tail( void )
 	add_to_response( buf, buflen );
 	}
 
-    buflen = snprintf( buf, sizeof(buf), "<HR>\n<ADDRESS><A HREF=\"%s\">%s</A></ADDRESS>\n</BODY></HTML>\n", SERVER_URL, SERVER_SOFTWARE );
+    buflen = snprintf( buf, sizeof(buf), "\
+<HR>\n\
+<ADDRESS><A HREF=\"%s\">%s</A></ADDRESS>\n\
+</BODY>\n\
+</HTML>\n",
+	SERVER_URL, SERVER_SOFTWARE );
     add_to_response( buf, buflen );
     }
 
 
 static void
-add_headers( int s, char* title, char* extra_header, char* mime_type, long b, time_t mod )
+add_headers( int s, char* title, char* extra_header, char* me, char* mt, off_t b, time_t mod )
     {
-    time_t now;
+    time_t now, expires;
     char timebuf[100];
     char buf[10000];
     int buflen;
@@ -1678,36 +2367,62 @@ add_headers( int s, char* title, char* extra_header, char* mime_type, long b, ti
     bytes = b;
     make_log_entry();
     start_response();
-    buflen = snprintf( buf, sizeof(buf), "%s %d %s\r\n", protocol, status, title );
+    buflen = snprintf( buf, sizeof(buf), "%s %d %s\015\012", protocol, status, title );
     add_to_response( buf, buflen );
-    buflen = snprintf( buf, sizeof(buf), "Server: %s\r\n", SERVER_SOFTWARE );
+    buflen = snprintf( buf, sizeof(buf), "Server: %s\015\012", SERVER_SOFTWARE );
     add_to_response( buf, buflen );
     now = time( (time_t*) 0 );
     (void) strftime( timebuf, sizeof(timebuf), rfc1123_fmt, gmtime( &now ) );
-    buflen = snprintf( buf, sizeof(buf), "Date: %s\r\n", timebuf );
+    buflen = snprintf( buf, sizeof(buf), "Date: %s\015\012", timebuf );
     add_to_response( buf, buflen );
-    if ( extra_header != (char*) 0 )
+    if ( extra_header != (char*) 0 && extra_header[0] != '\0' )
 	{
-	buflen = snprintf( buf, sizeof(buf), "%s\r\n", extra_header );
+	buflen = snprintf( buf, sizeof(buf), "%s\015\012", extra_header );
 	add_to_response( buf, buflen );
 	}
-    if ( mime_type != (char*) 0 )
+    if ( me != (char*) 0 && me[0] != '\0' )
 	{
-	buflen = snprintf( buf, sizeof(buf), "Content-Type: %s\r\n", mime_type );
+	buflen = snprintf( buf, sizeof(buf), "Content-Encoding: %s\015\012", me );
+	add_to_response( buf, buflen );
+	}
+    if ( mt != (char*) 0 && mt[0] != '\0' )
+	{
+	buflen = snprintf( buf, sizeof(buf), "Content-Type: %s\015\012", mt );
 	add_to_response( buf, buflen );
 	}
     if ( bytes >= 0 )
 	{
-	buflen = snprintf( buf, sizeof(buf), "Content-Length: %ld\r\n", bytes );
+#ifdef HAVE_INT64T
+	buflen = snprintf(
+	    buf, sizeof(buf), "Content-Length: %lld\015\012", (int64_t) bytes );
+#else /* HAVE_INT64T */
+	buflen = snprintf(
+	    buf, sizeof(buf), "Content-Length: %ld\015\012", (long) bytes );
+#endif /* HAVE_INT64T */
+	add_to_response( buf, buflen );
+	}
+    if ( p3p != (char*) 0 && p3p[0] != '\0' )
+	{
+	buflen = snprintf( buf, sizeof(buf), "P3P: %s\015\012", p3p );
+	add_to_response( buf, buflen );
+	}
+    if ( max_age >= 0 )
+	{
+	expires = now + max_age;
+	(void) strftime(
+	    timebuf, sizeof(timebuf), rfc1123_fmt, gmtime( &expires ) );
+	buflen = snprintf( buf, sizeof(buf),
+	    "Cache-Control: max-age=%d\015\012Expires: %s\015\012", max_age, timebuf );
 	add_to_response( buf, buflen );
 	}
     if ( mod != (time_t) -1 )
 	{
-	(void) strftime( timebuf, sizeof(timebuf), rfc1123_fmt, gmtime( &mod ) );
-	buflen = snprintf( buf, sizeof(buf), "Last-Modified: %s\r\n", timebuf );
+	(void) strftime(
+	    timebuf, sizeof(timebuf), rfc1123_fmt, gmtime( &mod ) );
+	buflen = snprintf( buf, sizeof(buf), "Last-Modified: %s\015\012", timebuf );
 	add_to_response( buf, buflen );
 	}
-    buflen = snprintf( buf, sizeof(buf), "Connection: close\r\n\r\n" );
+    buflen = snprintf( buf, sizeof(buf), "Connection: close\015\012\015\012" );
     add_to_response( buf, buflen );
     }
 
@@ -1720,7 +2435,7 @@ start_request( void )
     }
 
 static void
-add_to_request( char* str, int len )
+add_to_request( char* str, size_t len )
     {
     add_to_buf( &request, &request_size, &request_len, str, len );
     }
@@ -1734,12 +2449,12 @@ get_request_line( void )
     for ( i = request_idx; request_idx < request_len; ++request_idx )
 	{
 	c = request[request_idx];
-	if ( c == '\n' || c == '\r' )
+	if ( c == '\012' || c == '\015' )
 	    {
 	    request[request_idx] = '\0';
 	    ++request_idx;
-	    if ( c == '\r' && request_idx < request_len &&
-		 request[request_idx] == '\n' )
+	    if ( c == '\015' && request_idx < request_len &&
+		 request[request_idx] == '\012' )
 		{
 		request[request_idx] = '\0';
 		++request_idx;
@@ -1752,7 +2467,7 @@ get_request_line( void )
 
 
 static char* response;
-static int response_size, response_len;
+static size_t response_size, response_len;
 
 static void
 start_response( void )
@@ -1761,7 +2476,7 @@ start_response( void )
     }
 
 static void
-add_to_response( char* str, int len )
+add_to_response( char* str, size_t len )
     {
     add_to_buf( &response, &response_size, &response_len, str, len );
     }
@@ -1773,8 +2488,45 @@ send_response( void )
     }
 
 
-static int
-my_read( char* buf, int size )
+static void
+send_via_write( int fd, off_t size )
+    {
+    if ( size <= SIZE_T_MAX )
+	{
+	size_t size_size = (size_t) size;
+	void* ptr = mmap( 0, size_size, PROT_READ, MAP_PRIVATE, fd, 0 );
+	if ( ptr != (void*) -1 )
+	    {
+	    (void) my_write( ptr, size_size );
+	    (void) munmap( ptr, size_size );
+	    }
+#ifdef MADV_SEQUENTIAL
+	/* If we have madvise, might as well call it.  Although sequential
+	** access is probably already the default.
+	*/
+	(void) madvise( ptr, size_size, MADV_SEQUENTIAL );
+#endif /* MADV_SEQUENTIAL */
+	}
+    else
+	{
+	/* mmap can't deal with files larger than 2GB. */
+	char buf[30000];
+	ssize_t r;
+
+	for (;;)
+	    {
+	    r = read( fd, buf, sizeof(buf) );
+	    if ( r <= 0 )
+		break;
+	    if ( my_write( buf, r ) != r )
+		break;
+	    }
+	}
+    }
+
+
+static ssize_t
+my_read( char* buf, size_t size )
     {
 #ifdef USE_SSL
     if ( do_ssl )
@@ -1787,8 +2539,8 @@ my_read( char* buf, int size )
     }
 
 
-static int
-my_write( char* buf, int size )
+static ssize_t
+my_write( char* buf, size_t size )
     {
 #ifdef USE_SSL
     if ( do_ssl )
@@ -1801,26 +2553,35 @@ my_write( char* buf, int size )
     }
 
 
+#ifdef HAVE_SENDFILE
+static int
+my_sendfile( int fd, int socket, off_t offset, size_t nbytes )
+    {
+#ifdef HAVE_LINUX_SENDFILE
+	off_t lo = offset;
+	return sendfile( socket, fd, &lo, nbytes );
+#else /* HAVE_LINUX_SENDFILE */
+	return sendfile( fd, socket, offset, nbytes, (struct sf_hdtr*) 0, (off_t*) 0, 0 );
+#endif /* HAVE_LINUX_SENDFILE */
+    }
+#endif /* HAVE_SENDFILE */
+
+
 static void
-add_to_buf( char** bufP, int* bufsizeP, int* buflenP, char* str, int len )
+add_to_buf( char** bufP, size_t* bufsizeP, size_t* buflenP, char* str, size_t len )
     {
     if ( *bufsizeP == 0 )
 	{
 	*bufsizeP = len + 500;
 	*buflenP = 0;
-	*bufP = (char*) malloc( *bufsizeP );
+	*bufP = (char*) e_malloc( *bufsizeP );
 	}
     else if ( *buflenP + len >= *bufsizeP )
 	{
 	*bufsizeP = *buflenP + len + 500;
-	*bufP = (char*) realloc( (void*) *bufP, *bufsizeP );
+	*bufP = (char*) e_realloc( (void*) *bufP, *bufsizeP );
 	}
-    if ( *bufP == (char*) 0 )
-	{
-	(void) fprintf( stderr, "%s: out of memory\n", argv0 );
-	exit( 1 );
-	}
-    (void) memcpy( &((*bufP)[*buflenP]), str, len );
+    (void) memmove( &((*bufP)[*buflenP]), str, len );
     *buflenP += len;
     (*bufP)[*buflenP] = '\0';
     }
@@ -1843,6 +2604,14 @@ make_log_entry( void )
     if ( logfp == (FILE*) 0 )
 	return;
 
+    /* Fill in some null values. */
+    if ( protocol == (char*) 0 )
+	protocol = "UNKNOWN";
+    if ( path == (char*) 0 )
+	path = "";
+    if ( req_hostname == (char*) 0 )
+	req_hostname = hostname;
+
     /* Format the user. */
     if ( remoteuser != (char*) 0 )
 	ru = remoteuser;
@@ -1859,7 +2628,12 @@ make_log_entry( void )
 	(void) snprintf( url, sizeof(url), "%s", path );
     /* Format the bytes. */
     if ( bytes >= 0 )
-	(void) snprintf( bytes_str, sizeof(bytes_str), "%ld", bytes );
+#ifdef HAVE_INT64T
+	(void) snprintf(
+	    bytes_str, sizeof(bytes_str), "%lld", (int64_t) bytes );
+#else /* HAVE_INT64T */
+	(void) snprintf( bytes_str, sizeof(bytes_str), "%ld", (long) bytes );
+#endif /* HAVE_INT64T */
     else
 	(void) strcpy( bytes_str, "-" );
     /* Format the time, forcing a numeric timezone (some log analyzers
@@ -1884,10 +2658,111 @@ make_log_entry( void )
     (void) snprintf( date, sizeof(date), "%s %c%04d", date_nozone, sign, zone );
     /* And write the log entry. */
     (void) fprintf( logfp,
-	"%.80s - %.80s [%s] \"%.80s %.200s %.80s\" %d %s \"%.200s\" \"%.80s\"\n",
+	"%.80s - %.80s [%s] \"%.80s %.200s %.80s\" %d %s \"%.200s\" \"%.200s\"\n",
 	ntoa( &client_addr ), ru, date, get_method_str( method ), url,
 	protocol, status, bytes_str, referer, useragent );
     (void) fflush( logfp );
+    }
+
+
+/* Returns if it's ok to serve the url, otherwise generates an error
+** and exits.
+*/
+static void
+check_referer( void )
+    {
+    char* cp;
+
+    /* Are we doing referer checking at all? */
+    if ( url_pattern == (char*) 0 )
+	return;
+
+    /* Is it ok? */
+    if ( really_check_referer() )
+	return;
+
+    /* Lose. */
+    if ( vhost && req_hostname != (char*) 0 )
+	cp = req_hostname; 
+    else
+	cp = hostname;
+    if ( cp == (char*) 0 )
+	cp = "";
+    syslog(
+	LOG_INFO, "%.80s non-local referer \"%.80s%.80s\" \"%.80s\"",
+	ntoa( &client_addr ), cp, path, referer );
+    send_error( 403, "Forbidden", "", "You must supply a local referer." );
+    }
+
+
+/* Returns 1 if ok to serve the url, 0 if not. */
+static int
+really_check_referer( void )
+    {
+    char* cp1;
+    char* cp2;
+    char* cp3;
+    char* refhost;
+    char *lp;
+
+    /* Check for an empty referer. */
+    if ( referer == (char*) 0 || referer[0] == '\0' ||
+	 ( cp1 = strstr( referer, "//" ) ) == (char*) 0 )
+	{
+	/* Disallow if we require a referer and the url matches. */
+	if ( no_empty_referers && match( url_pattern, path ) )
+	    return 0;
+	/* Otherwise ok. */
+	return 1;
+	}
+
+    /* Extract referer host. */
+    cp1 += 2;
+    for ( cp2 = cp1; *cp2 != '/' && *cp2 != ':' && *cp2 != '\0'; ++cp2 )
+	continue;
+    refhost = (char*) e_malloc( cp2 - cp1 + 1 );
+    for ( cp3 = refhost; cp1 < cp2; ++cp1, ++cp3 )
+	if ( isupper(*cp1) )
+	    *cp3 = tolower(*cp1);
+	else
+	    *cp3 = *cp1;
+    *cp3 = '\0';
+
+    /* Local pattern? */
+    if ( local_pattern != (char*) 0 )
+	lp = local_pattern;
+    else
+	{
+	/* No local pattern.  What's our hostname? */
+	if ( ! vhost )
+	    {
+	    /* Not vhosting, use the server name. */
+	    lp = hostname;
+	    if ( lp == (char*) 0 )
+		/* Couldn't figure out local hostname - give up. */
+		return 1;
+	    }
+	else
+	    {
+	    /* We are vhosting, use the hostname on this connection. */
+	    lp = req_hostname;
+	    if ( lp == (char*) 0 )
+		/* Oops, no hostname.  Maybe it's an old browser that
+		** doesn't send a Host: header.  We could figure out
+		** the default hostname for this IP address, but it's
+		** not worth it for the few requests like this.
+		*/
+		return 1;
+	    }
+	}
+
+    /* If the referer host doesn't match the local host pattern, and
+    ** the URL does match the url pattern, it's an illegal reference.
+    */
+    if ( ! match( lp, refhost ) && match( url_pattern, path ) )
+	return 0;
+    /* Otherwise ok. */
+    return 1;
     }
 
 
@@ -1899,29 +2774,136 @@ get_method_str( int m )
 	case METHOD_GET: return "GET";
 	case METHOD_HEAD: return "HEAD";
 	case METHOD_POST: return "POST";
-	default: return (char*) 0;
+	default: return "UNKNOWN";
 	}
     }
 
 
-static char*
-get_mime_type( char* name )
-    {
-    struct {
-	char* ext;
-	char* type;
-	} table[] = {
+struct mime_entry {
+    char* ext;
+    size_t ext_len;
+    char* val;
+    size_t val_len;
+    };
+static struct mime_entry enc_tab[] = {
+#include "mime_encodings.h"
+    };
+static const int n_enc_tab = sizeof(enc_tab) / sizeof(*enc_tab);
+static struct mime_entry typ_tab[] = {
 #include "mime_types.h"
-	};
-    int fl = strlen( name );
+    };
+static const int n_typ_tab = sizeof(typ_tab) / sizeof(*typ_tab);
+
+
+/* qsort comparison routine - declared old-style on purpose, for portability. */
+static int
+ext_compare( a, b )
+    struct mime_entry* a;
+    struct mime_entry* b;
+    {
+    return strcmp( a->ext, b->ext );
+    }
+
+
+static void
+init_mime( void )
+    {
     int i;
 
-    for ( i = 0; i < sizeof(table) / sizeof(*table); ++i )
+    /* Sort the tables so we can do binary search. */
+    qsort( enc_tab, n_enc_tab, sizeof(*enc_tab), ext_compare );
+    qsort( typ_tab, n_typ_tab, sizeof(*typ_tab), ext_compare );
+
+    /* Fill in the lengths. */
+    for ( i = 0; i < n_enc_tab; ++i )
 	{
-	int el = strlen( table[i].ext );
-	if ( strcasecmp( &(name[fl - el]), table[i].ext ) == 0 )
-	    return table[i].type;
+	enc_tab[i].ext_len = strlen( enc_tab[i].ext );
+	enc_tab[i].val_len = strlen( enc_tab[i].val );
 	}
+    for ( i = 0; i < n_typ_tab; ++i )
+	{
+	typ_tab[i].ext_len = strlen( typ_tab[i].ext );
+	typ_tab[i].val_len = strlen( typ_tab[i].val );
+	}
+    }
+
+
+/* Figure out MIME encodings and type based on the filename.  Multiple
+** encodings are separated by semicolons.
+*/
+static char*
+figure_mime( char* name, char* me, size_t me_size )
+    {
+    char* prev_dot;
+    char* dot;
+    char* ext;
+    size_t ext_len, me_len;
+    int i, top, bot, mid;
+    int r;
+
+    me[0] = '\0';
+    me_len = 0;
+
+    /* Peel off encoding extensions until there aren't any more. */
+    for ( prev_dot = &name[strlen(name)]; ; prev_dot = dot )
+	{
+	for ( dot = prev_dot - 1; dot >= name && *dot != '.'; --dot )
+	    ;
+	if ( dot < name )
+	    {
+	    /* No dot found.  No more encoding extensions, and no type
+	    ** extension either.
+	    */
+	    return "text/plain; charset=%s";
+	    }
+	ext = dot + 1;
+	ext_len = prev_dot - ext;
+	/* Search the encodings table.  Linear search is fine here, there
+	** are only a few entries.
+	*/
+	for ( i = 0; i < n_enc_tab; ++i )
+	    {
+	    if ( ext_len == enc_tab[i].ext_len && strncasecmp( ext, enc_tab[i].ext, ext_len ) == 0 )
+		{
+		if ( me[0] != '\0' && me_len + 1 < me_size )
+		    {
+		    (void) strcpy( &me[me_len], "," );
+		    ++me_len;
+		    }
+		if ( me_len + enc_tab[i].val_len < me_size )
+		    {
+		    (void) strcpy( &me[me_len], enc_tab[i].val );
+		    me_len += enc_tab[i].val_len;
+		    }
+		goto next;
+		}
+	    }
+	/* No encoding extension found.  Break and look for a type extension. */
+	break;
+
+	next: ;
+	}
+
+    /* Binary search for a matching type extension. */
+    top = n_typ_tab - 1;
+    bot = 0;
+    while ( top >= bot )
+	{
+	mid = ( top + bot ) / 2;
+	r = strncasecmp( ext, typ_tab[mid].ext, ext_len );
+	if ( r < 0 )
+	    top = mid - 1;
+	else if ( r > 0 )
+	    bot = mid + 1;
+	else
+	    if ( ext_len < typ_tab[mid].ext_len )
+		top = mid - 1;
+	    else if ( ext_len > typ_tab[mid].ext_len )
+		bot = mid + 1;
+	    else
+		return typ_tab[mid].val;
+	}
+
     return "text/plain; charset=%s";
     }
 
@@ -1929,7 +2911,9 @@ get_mime_type( char* name )
 static void
 handle_sigterm( int sig )
     {
+    syslog( LOG_NOTICE, "exiting due to signal %d", sig );
     (void) fprintf( stderr, "%s: exiting due to signal %d\n", argv0, sig );
+    closelog();
     exit( 1 );
     }
 
@@ -1939,6 +2923,10 @@ handle_sigchld( int sig )
     {
     pid_t pid;
     int status;
+
+#ifndef HAVE_SIGSET
+    (void) signal( SIGCHLD, handle_sigchld );	/* set up handler again */
+#endif /* ! HAVE_SIGSET */
 
     /* Reap defunct children until there aren't any more. */
     for (;;)
@@ -1958,7 +2946,10 @@ handle_sigchld( int sig )
 	    ** but with some kernels it does anyway.  Ignore it.
 	    */
 	    if ( errno != ECHILD )
+		{
+		syslog( LOG_ERR, "child wait - %m" );
 		perror( "child wait" );
+		}
 	    break;
 	    }
 	}
@@ -1966,47 +2957,90 @@ handle_sigchld( int sig )
 
 
 static void
+handle_read_timeout( int sig )
+    {
+    syslog( LOG_INFO, "%.80s connection timed out reading", ntoa( &client_addr ) );
+    send_error(
+	408, "Request Timeout", "",
+	"No request appeared within a reasonable time period." );
+    }
+
+
+static void
+handle_write_timeout( int sig )
+    {
+    syslog( LOG_INFO, "%.80s connection timed out writing", ntoa( &client_addr ) );
+    exit( 1 );
+    }
+
+
+
+static void
 lookup_hostname( usockaddr* usa4P, size_t sa4_len, int* gotv4P, usockaddr* usa6P, size_t sa6_len, int* gotv6P )
     {
-#if defined(HAVE_GETADDRINFO) && defined(HAVE_GAI_STRERROR)
+#ifdef USE_IPV6
 
     struct addrinfo hints;
+    char portstr[10];
+    int gaierr;
     struct addrinfo* ai;
     struct addrinfo* ai2;
-    struct addrinfo* aiv4;
     struct addrinfo* aiv6;
-    int gaierr;
-    char strport[10];
+    struct addrinfo* aiv4;
 
-    memset( &hints, 0, sizeof(hints) );
-    hints.ai_family = AF_UNSPEC;
+    (void) memset( &hints, 0, sizeof(hints) );
+    hints.ai_family = PF_UNSPEC;
     hints.ai_flags = AI_PASSIVE;
     hints.ai_socktype = SOCK_STREAM;
-    (void) snprintf( strport, sizeof(strport), "%d", port );
-    if ( (gaierr = getaddrinfo( hostname, strport, &hints, &ai )) != 0 )
+    (void) snprintf( portstr, sizeof(portstr), "%d", (int) port );
+    if ( (gaierr = getaddrinfo( hostname, portstr, &hints, &ai )) != 0 )
 	{
-	(void) fprintf( stderr, "getaddrinfo %.80s - %s\n", hostname, gai_strerror( gaierr ) );
+	syslog(
+	    LOG_CRIT, "getaddrinfo %.80s - %s", hostname,
+	    gai_strerror( gaierr ) );
+	(void) fprintf(
+	    stderr, "%s: getaddrinfo %.80s - %s\n", argv0, hostname,
+	    gai_strerror( gaierr ) );
 	exit( 1 );
 	}
 
-    /* Find the first IPv4 and IPv6 entries. */
-    aiv4 = (struct addrinfo*) 0;
+    /* Find the first IPv6 and IPv4 entries. */
     aiv6 = (struct addrinfo*) 0;
+    aiv4 = (struct addrinfo*) 0;
     for ( ai2 = ai; ai2 != (struct addrinfo*) 0; ai2 = ai2->ai_next )
 	{
 	switch ( ai2->ai_family )
 	    {
-	    case AF_INET:
-	    if ( aiv4 == (struct addrinfo*) 0 )
-		aiv4 = ai2;
-	    break;
-#if defined(AF_INET6) && defined(HAVE_SOCKADDR_IN6)
 	    case AF_INET6:
 	    if ( aiv6 == (struct addrinfo*) 0 )
 		aiv6 = ai2;
 	    break;
-#endif /* AF_INET6 && HAVE_SOCKADDR_IN6 */
+	    case AF_INET:
+	    if ( aiv4 == (struct addrinfo*) 0 )
+		aiv4 = ai2;
+	    break;
 	    }
+	}
+
+    if ( aiv6 == (struct addrinfo*) 0 )
+	*gotv6P = 0;
+    else
+	{
+	if ( sa6_len < aiv6->ai_addrlen )
+	    {
+	    syslog(
+		LOG_CRIT, "%.80s - sockaddr too small (%lu < %lu)",
+		hostname, (unsigned long) sa6_len,
+		(unsigned long) aiv6->ai_addrlen );
+	    (void) fprintf(
+		stderr, "%s: %.80s - sockaddr too small (%lu < %lu)\n",
+		argv0, hostname, (unsigned long) sa6_len,
+		(unsigned long) aiv6->ai_addrlen );
+	    exit( 1 );
+	    }
+	(void) memset( usa6P, 0, sa6_len );
+	(void) memmove( usa6P, aiv6->ai_addr, aiv6->ai_addrlen );
+	*gotv6P = 1;
 	}
 
     if ( aiv4 == (struct addrinfo*) 0 )
@@ -2015,40 +3049,30 @@ lookup_hostname( usockaddr* usa4P, size_t sa4_len, int* gotv4P, usockaddr* usa6P
 	{
 	if ( sa4_len < aiv4->ai_addrlen )
 	    {
+	    syslog(
+		LOG_CRIT, "%.80s - sockaddr too small (%lu < %lu)",
+		hostname, (unsigned long) sa4_len,
+		(unsigned long) aiv4->ai_addrlen );
 	    (void) fprintf(
-		stderr, "%.80s - sockaddr too small (%d < %d)\n",
-		hostname, sa4_len, aiv4->ai_addrlen );
+		stderr, "%s: %.80s - sockaddr too small (%lu < %lu)\n",
+		argv0, hostname, (unsigned long) sa4_len,
+		(unsigned long) aiv4->ai_addrlen );
 	    exit( 1 );
 	    }
-	memset( usa4P, 0, sa4_len );
-	memcpy( usa4P, aiv4->ai_addr, aiv4->ai_addrlen );
+	(void) memset( usa4P, 0, sa4_len );
+	(void) memmove( usa4P, aiv4->ai_addr, aiv4->ai_addrlen );
 	*gotv4P = 1;
-	}
-    if ( aiv6 == (struct addrinfo*) 0 )
-	*gotv6P = 0;
-    else
-	{
-	if ( sa6_len < aiv6->ai_addrlen )
-	    {
-	    (void) fprintf(
-		stderr, "%.80s - sockaddr too small (%d < %d)\n",
-		hostname, sa6_len, aiv6->ai_addrlen );
-	    exit( 1 );
-	    }
-	memset( usa6P, 0, sa6_len );
-	memcpy( usa6P, aiv6->ai_addr, aiv6->ai_addrlen );
-	*gotv6P = 1;
 	}
 
     freeaddrinfo( ai );
 
-#else /* HAVE_GETADDRINFO && HAVE_GAI_STRERROR */
+#else /* USE_IPV6 */
 
     struct hostent* he;
 
     *gotv6P = 0;
 
-    memset( usa4P, 0, sa4_len );
+    (void) memset( usa4P, 0, sa4_len );
     usa4P->sa.sa_family = AF_INET;
     if ( hostname == (char*) 0 )
 	usa4P->sa_in.sin_addr.s_addr = htonl( INADDR_ANY );
@@ -2061,32 +3085,43 @@ lookup_hostname( usockaddr* usa4P, size_t sa4_len, int* gotv4P, usockaddr* usa6P
 	    if ( he == (struct hostent*) 0 )
 		{
 #ifdef HAVE_HSTRERROR
-		(void) fprintf( stderr, "gethostbyname %.80s - %s\n", hostname, hstrerror( h_errno ) );
+		syslog(
+		    LOG_CRIT, "gethostbyname %.80s - %s", hostname,
+		    hstrerror( h_errno ) );
+		(void) fprintf(
+		    stderr, "%s: gethostbyname %.80s - %s\n", argv0, hostname,
+		    hstrerror( h_errno ) );
 #else /* HAVE_HSTRERROR */
-		(void) fprintf( stderr, "gethostbyname %.80s failed\n", hostname );
+		syslog( LOG_CRIT, "gethostbyname %.80s failed", hostname );
+		(void) fprintf(
+		    stderr, "%s: gethostbyname %.80s failed\n", argv0,
+		    hostname );
 #endif /* HAVE_HSTRERROR */
 		exit( 1 );
 		}
 	    if ( he->h_addrtype != AF_INET )
 		{
-		(void) fprintf( stderr, "%.80s - non-IP network address\n", hostname );
+		syslog( LOG_CRIT, "%.80s - non-IP network address", hostname );
+		(void) fprintf(
+		    stderr, "%s: %.80s - non-IP network address\n", argv0,
+		    hostname );
 		exit( 1 );
 		}
-	    (void) memcpy(
+	    (void) memmove(
 		&usa4P->sa_in.sin_addr.s_addr, he->h_addr, he->h_length );
 	    }
 	}
     usa4P->sa_in.sin_port = htons( port );
     *gotv4P = 1;
 
-#endif /* HAVE_GETADDRINFO && HAVE_GAI_STRERROR */
+#endif /* USE_IPV6 */
     }
 
 
 static char*
 ntoa( usockaddr* usaP )
     {
-#ifdef HAVE_GETNAMEINFO
+#ifdef USE_IPV6
     static char str[200];
 
     if ( getnameinfo( &usaP->sa, sockaddr_len( usaP ), str, sizeof(str), 0, 0, NI_NUMERICHOST ) != 0 )
@@ -2094,13 +3129,17 @@ ntoa( usockaddr* usaP )
 	str[0] = '?';
 	str[1] = '\0';
 	}
+    else if ( IN6_IS_ADDR_V4MAPPED( &usaP->sa_in6.sin6_addr ) && strncmp( str, "::ffff:", 7 ) == 0 )
+	/* Elide IPv6ish prefix for IPv4 addresses. */
+	(void) strcpy( str, &str[7] );
+
     return str;
 
-#else /* HAVE_GETNAMEINFO */
+#else /* USE_IPV6 */
 
     return inet_ntoa( usaP->sa_in.sin_addr );
 
-#endif /* HAVE_GETNAMEINFO */
+#endif /* USE_IPV6 */
     }
 
 
@@ -2110,9 +3149,9 @@ sockaddr_check( usockaddr* usaP )
     switch ( usaP->sa.sa_family )
 	{
 	case AF_INET: return 1;
-#if defined(AF_INET6) && defined(HAVE_SOCKADDR_IN6)
+#ifdef USE_IPV6
 	case AF_INET6: return 1;
-#endif /* AF_INET6 && HAVE_SOCKADDR_IN6 */
+#endif /* USE_IPV6 */
 	default:
 	return 0;
 	}
@@ -2125,9 +3164,9 @@ sockaddr_len( usockaddr* usaP )
     switch ( usaP->sa.sa_family )
 	{
 	case AF_INET: return sizeof(struct sockaddr_in);
-#if defined(AF_INET6) && defined(HAVE_SOCKADDR_IN6)
+#ifdef USE_IPV6
 	case AF_INET6: return sizeof(struct sockaddr_in6);
-#endif /* AF_INET6 && HAVE_SOCKADDR_IN6 */
+#endif /* USE_IPV6 */
 	default:
 	return 0;	/* shouldn't happen */
 	}
@@ -2207,14 +3246,14 @@ b64_decode( const char* str, unsigned char* space, int size )
     {
     const char* cp;
     int space_idx, phase;
-    int d, prev_d;
+    int d, prev_d = 0;
     unsigned char c;
 
     space_idx = 0;
     phase = 0;
     for ( cp = str; *cp != '\0'; ++cp )
 	{
-	d = b64_decode_table[*cp];
+	d = b64_decode_table[(int) *cp];
 	if ( d != -1 )
 	    {
 	    switch ( phase )
@@ -2248,63 +3287,6 @@ b64_decode( const char* str, unsigned char* space, int size )
     }
 
 
-/* Simple shell-style filename matcher.  Only does ? * and **, and multiple
-** patterns separated by |.  Returns 1 or 0.
-*/
-int
-match( const char* pattern, const char* string )
-    {
-    const char* or;
-
-    for (;;)
-	{
-	or = strchr( pattern, '|' );
-	if ( or == (char*) 0 )
-	    return match_one( pattern, strlen( pattern ), string );
-	if ( match_one( pattern, or - pattern, string ) )
-	    return 1;
-	pattern = or + 1;
-	}
-    }
-
-
-static int
-match_one( const char* pattern, int patternlen, const char* string )
-    {
-    const char* p;
-
-    for ( p = pattern; p - pattern < patternlen; ++p, ++string )
-	{
-	if ( *p == '?' && *string != '\0' )
-	    continue;
-	if ( *p == '*' )
-	    {
-	    int i, pl;
-	    ++p;
-	    if ( *p == '*' )
-		{
-		/* Double-wildcard matches anything. */
-		++p;
-		i = strlen( string );
-		}
-	    else
-		/* Single-wildcard matches anything but slash. */
-		i = strcspn( string, "/" );
-	    pl = patternlen - ( p - pattern );
-	    for ( ; i >= 0; --i )
-		if ( match_one( p, pl, &(string[i]) ) )
-		    return 1;
-	    return 0;
-	    }
-	if ( *p != *string )
-	    return 0;
-	}
-    if ( *string == '\0' )
-	return 1;
-    return 0;
-    }
-
-
 /* Set NDELAY mode on a socket. */
 static void
 set_ndelay( int fd )
@@ -2335,3 +3317,70 @@ clear_ndelay( int fd )
 	    (void) fcntl( fd, F_SETFL, newflags );
 	}
     }
+
+
+static void*
+e_malloc( size_t size )
+    {
+    void* ptr;
+
+    ptr = malloc( size );
+    if ( ptr == (void*) 0 )
+	{
+	syslog( LOG_CRIT, "out of memory" );
+	(void) fprintf( stderr, "%s: out of memory\n", argv0 );
+	exit( 1 );
+	}
+    return ptr;
+    }
+
+
+static void*
+e_realloc( void* optr, size_t size )
+    {
+    void* ptr;
+
+    ptr = realloc( optr, size );
+    if ( ptr == (void*) 0 )
+	{
+	syslog( LOG_CRIT, "out of memory" );
+	(void) fprintf( stderr, "%s: out of memory\n", argv0 );
+	exit( 1 );
+	}
+    return ptr;
+    }
+
+
+static char*
+e_strdup( char* ostr )
+    {
+    char* str;
+
+    str = strdup( ostr );
+    if ( str == (char*) 0 )
+	{
+	syslog( LOG_CRIT, "out of memory copying a string" );
+	(void) fprintf( stderr, "%s: out of memory copying a string\n", argv0 );
+	exit( 1 );
+	}
+    return str;
+    }
+
+
+#ifdef NO_SNPRINTF
+/* Some systems don't have snprintf(), so we make our own that uses
+** vsprintf().  This workaround is probably vulnerable to buffer overruns,
+** so upgrade your OS!
+*/
+static int
+snprintf( char* str, size_t size, const char* format, ... )
+    {
+    va_list ap;
+    int r;
+
+    va_start( ap, format );
+    r = vsprintf( str, format, ap );
+    va_end( ap );
+    return r;
+    }
+#endif /* NO_SNPRINTF */

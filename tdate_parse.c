@@ -199,7 +199,7 @@ tdate_parse( char* str )
     time_t t;
 
     /* Initialize. */
-    memset( (char*) &tm, 0, sizeof(struct tm) );
+    (void) memset( (char*) &tm, 0, sizeof(struct tm) );
 
     /* Skip initial whitespace ourselves - sscanf is clumsy at this. */
     for ( cp = str; *cp == ' ' || *cp == '\t'; ++cp )

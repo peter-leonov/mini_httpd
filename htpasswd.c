@@ -23,7 +23,8 @@ extern char *crypt(const char *key, const char *setting);
 
 #define MAX_STRING_LEN 256
 
-char *tn;
+int tfd;
+char temp_template[] = "/tmp/htp.XXXXXX";
 
 void interrupted(int);
 
@@ -124,8 +125,8 @@ add_password( char* user, FILE* f )
 	if ( strcmp( pw, (char*) getpass( "Re-type new password:" ) ) != 0 )
 	    {
 	    (void) fprintf( stderr, "They don't match, sorry.\n" );
-	    if ( tn )
-		unlink( tn );
+	    if ( tfd != -1 )
+		unlink( temp_template );
 	    exit( 1 );
 	    }
 	}
@@ -143,7 +144,7 @@ static void usage(void) {
 
 void interrupted(int signo) {
     fprintf(stderr,"Interrupted.\n");
-    if(tn) unlink(tn);
+    if(tfd != -1) unlink(temp_template);
     exit(1);
 }
 
@@ -156,7 +157,7 @@ int main(int argc, char *argv[]) {
     char command[MAX_STRING_LEN];
     int found;
 
-    tn = NULL;
+    tfd = -1;
     signal(SIGINT,(void (*)(int))interrupted);
     if(argc == 4) {
         if(strcmp(argv[1],"-c"))
@@ -173,8 +174,8 @@ int main(int argc, char *argv[]) {
         exit(0);
     } else if(argc != 3) usage();
 
-    tn = tmpnam(NULL);
-    if(!(tfp = fopen(tn,"w"))) {
+    tfd = mkstemp(temp_template);
+    if(!(tfp = fdopen(tfd,"w"))) {
         fprintf(stderr,"Could not open temp file.\n");
         exit(1);
     }
@@ -211,8 +212,8 @@ int main(int argc, char *argv[]) {
     }
     fclose(f);
     fclose(tfp);
-    sprintf(command,"cp %s %s",tn,argv[1]);
+    sprintf(command,"cp %s %s",temp_template,argv[1]);
     system(command);
-    unlink(tn);
+    unlink(temp_template);
     exit(0);
 }

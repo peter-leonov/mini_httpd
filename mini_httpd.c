@@ -306,14 +306,24 @@ main( int argc, char** argv )
 	exit( 1 );
 	}
 
-    if ( gotv4 )
-	listen4_fd = initialize_listen_socket( &host_addr4 );
-    else
-	listen4_fd = -1;
+    /* Initialize listen sockets.  Try v6 first because of a Linux peculiarity; 
+    ** unlike other systems, it has magical v6 sockets that also listen for v4,
+    ** but if you bind a v4 socket first then the v6 bind fails.
+    */
     if ( gotv6 )
 	listen6_fd = initialize_listen_socket( &host_addr6 );
     else
 	listen6_fd = -1;
+    if ( gotv4 )
+	listen4_fd = initialize_listen_socket( &host_addr4 );
+    else
+	listen4_fd = -1;
+    /* If we didn't get any valid sockets, fail. */
+    if ( listen4_fd == -1 && listen6_fd == -1 )
+	{
+	(void) fprintf( stderr, "can't bind to any address\n" );
+	exit( 1 );
+	}
 
 #ifdef USE_SSL
     if ( do_ssl )
@@ -536,9 +546,9 @@ static void
 usage( void )
     {
 #ifdef USE_SSL
-    (void) fprintf( stderr, "usage:  %s [-S] [-p port] [-c cgipat] [-u user] [-h hostname] [-r] [-v] [-l logfile] [-i pidfile] [-T charset]\n", argv0 );
+    (void) fprintf( stderr, "usage:  %s [-D] [-S] [-p port] [-c cgipat] [-u user] [-h hostname] [-r] [-v] [-l logfile] [-i pidfile] [-T charset]\n", argv0 );
 #else /* USE_SSL */
-    (void) fprintf( stderr, "usage:  %s [-p port] [-c cgipat] [-u user] [-h hostname] [-r] [-v] [-l logfile] [-i pidfile] [-T charset]\n", argv0 );
+    (void) fprintf( stderr, "usage:  %s [-D] [-p port] [-c cgipat] [-u user] [-h hostname] [-r] [-v] [-l logfile] [-i pidfile] [-T charset]\n", argv0 );
 #endif /* USE_SSL */
     exit( 1 );
     }
@@ -554,24 +564,24 @@ initialize_listen_socket( usockaddr* usaP )
     if ( listen_fd < 0 )
 	{
 	perror( "socket" );
-	exit( 1 );
+	return -1;
 	}
     (void) fcntl( listen_fd, F_SETFD, 1 );
     i = 1;
     if ( setsockopt( listen_fd, SOL_SOCKET, SO_REUSEADDR, (char*) &i, sizeof(i) ) < 0 )
 	{
 	perror( "setsockopt" );
-	exit( 1 );
+	return -1;
 	}
     if ( bind( listen_fd, &usaP->sa, sockaddr_len( usaP ) ) < 0 )
 	{
 	perror( "bind" );
-	exit( 1 );
+	return -1;
 	}
     if ( listen( listen_fd, 1024 ) < 0 )
 	{
 	perror( "listen" );
-	exit( 1 );
+	return -1;
 	}
     return listen_fd;
     }
@@ -1541,6 +1551,20 @@ send_error_tail( void )
     {
     char buf[500];
     int buflen;
+
+    if ( match( "**MSIE**", useragent ) )
+	{
+	int n;
+	buflen = snprintf( buf, sizeof(buf), "<!--\n" );
+	add_to_response( buf, buflen );
+	for ( n = 0; n < 6; ++n )
+	    {
+	    buflen = snprintf( buf, sizeof(buf), "Padding so that MSIE deigns to show this error instead of its own canned one.\n" );
+	    add_to_response( buf, buflen );
+	    }
+	buflen = snprintf( buf, sizeof(buf), "-->\n" );
+	add_to_response( buf, buflen );
+	}
 
     buflen = snprintf( buf, sizeof(buf), "<HR>\n<ADDRESS><A HREF=\"%s\">%s</A></ADDRESS>\n</BODY></HTML>\n", SERVER_URL, SERVER_SOFTWARE );
     add_to_response( buf, buflen );

@@ -20,6 +20,7 @@ mini_httpd - small HTTP server
 .RB [ -T
 .IR charset ]
 .RB [ -S ]
+.RB [ -D ]
 .SH DESCRIPTION
 .PP
 .I mini_httpd
@@ -113,6 +114,14 @@ The default is iso-8859-1.
 .B -S
 If mini_httpd is configured to do SSL/HTTPS, then the -S flag is available
 to enable this feature.
+.TP
+.B -D
+This was originally just a debugging flag, however it's worth mentioning
+because one of the things it does is prevent mini_httpd from making itself
+a background daemon.
+Instead it runs in the foreground like a regular program.
+This is necessary when you want to run mini_httpd wrapped in a little shell
+script that restarts it if it exits.
 .SH "CGI"
 .PP
 mini_httpd supports the CGI 1.1 spec.

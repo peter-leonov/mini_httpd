@@ -74,6 +74,7 @@ tar:
 	  mkdir $$name ; \
 	  tar cf - `cat FILES` | ( cd $$name ; tar xfBp - ) ; \
 	  chmod 644 $$name/Makefile $$name/mime_types.txt ; \
+	  chmod 755 $$name/contrib $$name/contrib/redhat-rpm ; \
 	  tar cf $$name.tar $$name ; \
 	  rm -rf $$name ; \
 	  gzip $$name.tar

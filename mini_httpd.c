@@ -100,6 +100,7 @@ static char hostname_buf[500];
 static u_int hostaddr;
 static char* logfile;
 static char* pidfile;
+static char* charset;
 static FILE* logfp;
 static int listen4_fd, listen6_fd;
 #ifdef USE_SSL
@@ -203,6 +204,7 @@ main( int argc, char** argv )
     do_chroot = 0;
     vhost = 0;
     cgi_pattern = (char*) 0;
+    charset = "iso-8859-1";
     user = DEFAULT_USER;
     hostname = (char*) 0;
     logfile = (char*) 0;
@@ -253,6 +255,11 @@ main( int argc, char** argv )
 	    {
 	    ++argn;
 	    pidfile = argv[argn];
+	    }
+	else if ( strcmp( argv[argn], "-T" ) == 0 && argn + 1 < argc )
+	    {
+	    ++argn;
+	    charset = argv[argn];
 	    }
 	else
 	    usage();
@@ -529,9 +536,9 @@ static void
 usage( void )
     {
 #ifdef USE_SSL
-    (void) fprintf( stderr, "usage:  %s [-S] [-p port] [-c cgipat] [-u user] [-h hostname] [-r] [-v] [-l logfile] [-i pidfile]\n", argv0 );
+    (void) fprintf( stderr, "usage:  %s [-S] [-p port] [-c cgipat] [-u user] [-h hostname] [-r] [-v] [-l logfile] [-i pidfile] [-T charset]\n", argv0 );
 #else /* USE_SSL */
-    (void) fprintf( stderr, "usage:  %s [-p port] [-c cgipat] [-u user] [-h hostname] [-r] [-v] [-l logfile] [-i pidfile]\n", argv0 );
+    (void) fprintf( stderr, "usage:  %s [-p port] [-c cgipat] [-u user] [-h hostname] [-r] [-v] [-l logfile] [-i pidfile] [-T charset]\n", argv0 );
 #endif /* USE_SSL */
     exit( 1 );
     }
@@ -803,6 +810,8 @@ static void
 do_file( void )
     {
     char buf[10000];
+    char* type;
+    char fixed_type[500];
     char* cp;
     int fd;
     void* ptr;
@@ -832,17 +841,18 @@ do_file( void )
     fd = open( file, O_RDONLY );
     if ( fd < 0 )
 	send_error( 403, "Forbidden", (char*) 0, "File is protected." );
+    type = get_mime_type( file );
+    (void) snprintf( fixed_type, sizeof(fixed_type), type, charset );
     if ( if_modified_since != (time_t) -1 &&
 	 if_modified_since >= sb.st_mtime )
 	{
 	add_headers(
-	    304, "Not Modified", (char*) 0, get_mime_type( file ), sb.st_size,
+	    304, "Not Modified", (char*) 0, fixed_type, sb.st_size,
 	    sb.st_mtime );
 	send_response();
 	return;
 	}
-    add_headers(
-	200, "Ok", (char*) 0, get_mime_type( file ), sb.st_size, sb.st_mtime );
+    add_headers( 200, "Ok", (char*) 0, fixed_type, sb.st_size, sb.st_mtime );
     send_response();
     if ( method == METHOD_HEAD )
 	return;
@@ -1794,7 +1804,7 @@ get_mime_type( char* name )
 	if ( strcasecmp( &(name[fl - el]), table[i].ext ) == 0 )
 	    return table[i].type;
 	}
-    return "text/plain; charset=iso-8859-1";
+    return "text/plain; charset=%s";
     }
 
 

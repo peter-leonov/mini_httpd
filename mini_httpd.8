@@ -17,6 +17,8 @@ mini_httpd - small HTTP server
 .IR logfile ]
 .RB [ -i
 .IR pidfile ]
+.RB [ -T
+.IR charset ]
 .RB [ -S ]
 .SH DESCRIPTION
 .PP
@@ -103,6 +105,10 @@ The default is no logging.
 Specifies a file to write the process-id to.
 If no file is specified, no process-id is written.
 You can use this file to send signals to mini_httpd.
+.TP
+.B -T
+Specifies the character set to use with text MIME types.
+The default is iso-8859-1.
 .TP
 .B -S
 If mini_httpd is configured to do SSL/HTTPS, then the -S flag is available

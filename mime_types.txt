@@ -3,9 +3,9 @@
 # A list of file extensions followed by the corresponding MIME type.
 # Extensions not found in the table are returned as text/plain.
 
-.html		text/html; charset=iso-8859-1
-.htm		text/html; charset=iso-8859-1
-.txt		text/plain; charset=iso-8859-1
+.html		text/html; charset=%s
+.htm		text/html; charset=%s
+.txt		text/plain; charset=%s
 .rtx		text/richtext
 .etx		text/x-setext
 .tsv		text/tab-separated-values
@@ -124,3 +124,9 @@
 .mime		message/rfc822
 
 .pac		application/x-ns-proxy-autoconfig
+
+.wml		text/vnd.wap.wml
+.wmlc		application/vnd.wap.wmlc
+.wmls		text/vnd.wap.wmlscript
+.wmlsc		application/vnd.wap.wmlscriptc
+.wbmp		image/vnd.wap.wbmp

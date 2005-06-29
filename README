@@ -1,5 +1,5 @@
 	            mini_httpd - small HTTP server
-		      version 1.18 of 26oct2003
+		      version 1.19 of 19dec2003
 
 mini_httpd is a small HTTP server.  Its performance is not great, but for
 low or medium traffic sites it's quite adequate. It implements all the
@@ -48,11 +48,11 @@ If you're doing SSL, uncomment those lines too.  Otherwise, just do a make.
 
 On Red Hat Linux systems you can use RPM to install mini_httpd, like so:
     cd /usr/src/redhat/SOURCES
-    wget http://www.acme.com/software/mini_httpd/mini_httpd-1.16.tar.gz
-    rpm -ta mini_httpd-1.16.tar.gz
-    rpm -i /usr/src/redhat/RPMS/i386/mini_httpd-1.16-1.i386.rpm
+    wget http://www.acme.com/software/mini_httpd/mini_httpd-1.19.tar.gz
+    rpm -ta mini_httpd-1.19.tar.gz
+    rpm -i /usr/src/redhat/RPMS/i386/mini_httpd-1.19-1.i386.rpm
 
 Feedback is welcome - send bug reports, enhancements, checks, money
 orders, etc. to the addresses below.
 
-    Jef Poskanzer  jef@acme.com  http://www.acme.com/jef/
+    Jef Poskanzer  jef@mail.acme.com  http://www.acme.com/jef/

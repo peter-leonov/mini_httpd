@@ -182,7 +182,7 @@ server certificate with this flag.
 You can make a certificate with the command "make cert".
 The default is "mini_httpd.pem" (in the directory where you start mini_httpd).
 The config-file option name for this flag is "certfile".
-.TP 
+.TP
 .B -Y
 If mini_httpd is configured to do SSL/HTTPS, then you can specify a
 cipher set with this flag.
@@ -395,12 +395,17 @@ If not specified it defaults to the actual local hostname.
 .PP
 mini_httpd will terminate cleanly upon receipt of a number of different
 signals, which you can send via the standard Unix kill(1) command.
-Any of SIGTERM, SIGINT, SIGHUP, or SIGUSR1 will do the trick.
+Any of SIGTERM, SIGINT, or SIGUSR1 will do the trick.
 All requests in progress will be completed.
 The network socket used to accept new connections gets
 closed immediately, which means a fresh mini_httpd can be started up
 right away.
 This is convenient when you're rotating your log files.
+.PP
+In addition, a SIGHUP will attempt to close and re-open the log file.
+This is a little tricky to set up correctly, for instance if you are using
+chroot() then the log file must be within the chroot tree, but it's
+definitely doable.
 .SH CERTIFICATES
 .PP
 If you're going to serve SSL/HTTPS you will need a server certificate.
@@ -427,7 +432,7 @@ You don't need cert.csr and privkey.pem, and may remove them.
 .SH "SEE ALSO"
 htpasswd(1), weblog_parse(1), http_get(1)
 .SH AUTHOR
-Copyright © 1999,2000 by Jef Poskanzer <jef@acme.com>. All rights reserved.
+Copyright © 1999,2000 by Jef Poskanzer <jef@mail.acme.com>. All rights reserved.
 .\" Redistribution and use in source and binary forms, with or without
 .\" modification, are permitted provided that the following conditions
 .\" are met:

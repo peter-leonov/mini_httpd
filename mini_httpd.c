@@ -1,6 +1,6 @@
 /* mini_httpd - small HTTP server
 **
-** Copyright © 1999,2000 by Jef Poskanzer <jef@acme.com>.
+** Copyright © 1999,2000 by Jef Poskanzer <jef@mail.acme.com>.
 ** All rights reserved.
 **
 ** Redistribution and use in source and binary forms, with or without
@@ -95,11 +95,19 @@ extern char* crypt( const char* key, const char* setting );
 #define SIZE_T_MAX 2147483647L
 #endif
 
-#ifndef max
-#define max(a,b) ((a) > (b) ? (a) : (b))
+#ifndef HAVE_INT64T
+typedef long long int64_t;
 #endif
-#ifndef min
-#define min(a,b) ((a) < (b) ? (a) : (b))
+
+#ifdef __CYGWIN__
+#define timezone  _timezone
+#endif
+
+#ifndef MAX
+#define MAX(a,b) ((a) > (b) ? (a) : (b))
+#endif
+#ifndef MIN
+#define MIN(a,b) ((a) < (b) ? (a) : (b))
 #endif
 
 
@@ -188,6 +196,7 @@ static char* cipher;
 static SSL_CTX* ssl_ctx;
 #endif /* USE_SSL */
 static char cwd[MAXPATHLEN];
+static int got_hup;
 
 
 /* Request variables. */
@@ -269,9 +278,11 @@ static void check_referer( void );
 static int really_check_referer( void );
 static char* get_method_str( int m );
 static void init_mime( void );
-static char* figure_mime( char* name, char* me, size_t me_size );
+static const char* figure_mime( char* name, char* me, size_t me_size );
 static void handle_sigterm( int sig );
+static void handle_sighup( int sig );
 static void handle_sigchld( int sig );
+static void re_open_logfile( void );
 static void handle_read_timeout( int sig );
 static void handle_write_timeout( int sig );
 static void lookup_hostname( usockaddr* usa4P, size_t sa4_len, int* gotv4P, usockaddr* usa6P, size_t sa6_len, int* gotv6P );
@@ -295,7 +306,9 @@ int
 main( int argc, char** argv )
     {
     int argn;
+    struct passwd* pwd;
     uid_t uid = 32767;
+    gid_t gid = 32767;
     usockaddr host_addr4;
     usockaddr host_addr6;
     int gotv4, gotv6;
@@ -426,7 +439,7 @@ main( int argc, char** argv )
 	usage();
 
     cp = strrchr( argv0, '/' );
-    if ( cp != (char*) 0 ) 
+    if ( cp != (char*) 0 )
 	++cp;
     else
 	cp = argv0;
@@ -444,6 +457,22 @@ main( int argc, char** argv )
 #endif /* USE_SSL */
 	}
 
+    /* If we're root and we're going to become another user, get the uid/gid
+    ** now.
+    */
+    if ( getuid() == 0 )
+	{
+	pwd = getpwnam( user );
+	if ( pwd == (struct passwd*) 0 )
+	    {
+	    syslog( LOG_CRIT, "unknown user - '%s'", user );
+	    (void) fprintf( stderr, "%s: unknown user - '%s'\n", argv0, user );
+	    exit( 1 );
+	    }
+	uid = pwd->pw_uid;
+	gid = pwd->pw_gid;
+	}
+
     /* Log file. */
     if ( logfile != (char*) 0 )
 	{
@@ -453,6 +482,22 @@ main( int argc, char** argv )
 	    syslog( LOG_CRIT, "%s - %m", logfile );
 	    perror( logfile );
 	    exit( 1 );
+	    }
+	if ( logfile[0] != '/' )
+	    {
+	    syslog( LOG_WARNING, "logfile is not an absolute path, you may not be able to re-open it" );
+	    (void) fprintf( stderr, "%s: logfile is not an absolute path, you may not be able to re-open it\n", argv0 );
+	    }
+	if ( getuid() == 0 )
+	    {
+	    /* If we are root then we chown the log file to the user we'll
+	    ** be switching to.
+	    */
+	    if ( fchown( fileno( logfp ), uid, gid ) < 0 )
+		{
+		syslog( LOG_WARNING, "fchown logfile - %m" );
+		perror( "fchown logfile" );
+		}
 	    }
 	}
 
@@ -574,14 +619,6 @@ main( int argc, char** argv )
     /* If we're root, start becoming someone else. */
     if ( getuid() == 0 )
 	{
-	struct passwd* pwd;
-	pwd = getpwnam( user );
-	if ( pwd == (struct passwd*) 0 )
-	    {
-	    syslog( LOG_CRIT, "unknown user - '%s'", user );
-	    (void) fprintf( stderr, "%s: unknown user - '%s'\n", argv0, user );
-	    exit( 1 );
-	    }
 	/* Set aux groups to null. */
 	if ( setgroups( 0, (gid_t*) 0 ) < 0 )
 	    {
@@ -590,14 +627,14 @@ main( int argc, char** argv )
 	    exit( 1 );
 	    }
 	/* Set primary group. */
-	if ( setgid( pwd->pw_gid ) < 0 )
+	if ( setgid( gid ) < 0 )
 	    {
 	    syslog( LOG_CRIT, "setgid - %m" );
 	    perror( "setgid" );
 	    exit( 1 );
 	    }
 	/* Try setting aux groups correctly - not critical if this fails. */
-	if ( initgroups( user, pwd->pw_gid ) < 0 )
+	if ( initgroups( user, gid ) < 0 )
 	    {
 	    syslog( LOG_ERR, "initgroups - %m" );
 	    perror( "initgroups" );
@@ -606,8 +643,6 @@ main( int argc, char** argv )
 	/* Set login name. */
 	(void) setlogin( user );
 #endif /* HAVE_SETLOGIN */
-	/* Save the new uid for setting after we chroot(). */
-	uid = pwd->pw_uid;
 	}
 
     /* Switch directories if requested. */
@@ -635,6 +670,25 @@ main( int argc, char** argv )
 	    perror( "chroot" );
 	    exit( 1 );
 	    }
+	/* If we're logging and the logfile's pathname begins with the
+	** chroot tree's pathname, then elide the chroot pathname so
+	** that the logfile pathname still works from inside the chroot
+	** tree.
+	*/
+	if ( logfile != (char*) 0 )
+	    if ( strncmp( logfile, cwd, strlen( cwd ) ) == 0 )
+		{
+		(void) strcpy( logfile, &logfile[strlen( cwd ) - 1] );
+		/* (We already guaranteed that cwd ends with a slash, so leaving
+		** that slash in logfile makes it an absolute pathname within
+		** the chroot tree.)
+		*/
+		}
+	    else
+		{
+		syslog( LOG_WARNING, "logfile is not within the chroot tree, you will not be able to re-open it" );
+		(void) fprintf( stderr, "%s: logfile is not within the chroot tree, you will not be able to re-open it\n", argv0 );
+		}
 	(void) strcpy( cwd, "/" );
 	/* Always chdir to / after a chroot. */
 	if ( chdir( cwd ) < 0 )
@@ -681,18 +735,19 @@ main( int argc, char** argv )
 #ifdef HAVE_SIGSET
     (void) sigset( SIGTERM, handle_sigterm );
     (void) sigset( SIGINT, handle_sigterm );
-    (void) sigset( SIGHUP, handle_sigterm );
     (void) sigset( SIGUSR1, handle_sigterm );
+    (void) sigset( SIGHUP, handle_sighup );
     (void) sigset( SIGCHLD, handle_sigchld );
     (void) sigset( SIGPIPE, SIG_IGN );
 #else /* HAVE_SIGSET */
     (void) signal( SIGTERM, handle_sigterm );
     (void) signal( SIGINT, handle_sigterm );
-    (void) signal( SIGHUP, handle_sigterm );
     (void) signal( SIGUSR1, handle_sigterm );
+    (void) signal( SIGHUP, handle_sighup );
     (void) signal( SIGCHLD, handle_sigchld );
     (void) signal( SIGPIPE, SIG_IGN );
 #endif /* HAVE_SIGSET */
+    got_hup = 0;
 
     init_mime();
 
@@ -708,7 +763,22 @@ main( int argc, char** argv )
     /* Main loop. */
     for (;;)
 	{
-	/* Possibly do a select() on the possible two listen fds. */
+	/* Do we need to re-open the log file? */
+	if ( got_hup )
+	    {
+	    re_open_logfile();
+	    got_hup = 0;
+	    }
+
+	/* Do a select() on at least one and possibly two listen fds.
+	** If there's only one listen fd then we could skip the select
+	** and just do the (blocking) accept(), saving one system call;
+	** that's what happened up through version 1.18.  However there
+	** is one slight drawback to that method: the blocking accept()
+	** is not interrupted by a signal call.  Since we definitely want
+	** signals to interrupt a waiting server, we use select() even
+	** if there's only one fd.
+	*/
 	FD_ZERO( &lfdset );
 	maxfd = -1;
 	if ( listen4_fd != -1 )
@@ -723,19 +793,14 @@ main( int argc, char** argv )
 	    if ( listen6_fd > maxfd )
 		maxfd = listen6_fd;
 	    }
-	if ( listen4_fd != -1 && listen6_fd != -1 )
-	    if ( select( maxfd + 1, &lfdset, (fd_set*) 0, (fd_set*) 0, (struct timeval*) 0 ) < 0 )
-		{
-		if ( errno == EINTR )
-		    continue;	/* try again */
-		syslog( LOG_CRIT, "select - %m" );
-		perror( "select" );
-		exit( 1 );
-		}
-	/* (If we don't have two listen fds, we can just skip the select()
-	** and fall through.  Whichever listen fd we do have will do a
-	** blocking accept() instead.)
-	*/
+	if ( select( maxfd + 1, &lfdset, (fd_set*) 0, (fd_set*) 0, (struct timeval*) 0 ) < 0 )
+	    {
+	    if ( errno == EINTR || errno == EAGAIN )
+		continue;	/* try again */
+	    syslog( LOG_CRIT, "select - %m" );
+	    perror( "select" );
+	    exit( 1 );
+	    }
 
 	/* Accept the new connection. */
 	sz = sizeof(usa);
@@ -751,7 +816,7 @@ main( int argc, char** argv )
 	    }
 	if ( conn_fd < 0 )
 	    {
-	    if ( errno == EINTR )
+	    if ( errno == EINTR || errno == EAGAIN )
 		continue;	/* try again */
 #ifdef EPROTO
 	    if ( errno == EPROTO )
@@ -1125,6 +1190,8 @@ handle_request( void )
 	{
 	char buf[10000];
 	int r = my_read( buf, sizeof(buf) );
+	if ( r < 0 && ( errno == EINTR || errno == EAGAIN ) )
+	    continue;
 	if ( r <= 0 )
 	    break;
 	(void) alarm( READ_TIMEOUT );
@@ -1188,7 +1255,7 @@ handle_request( void )
 	    cp = &line[5];
 	    cp += strspn( cp, " \t" );
 	    host = cp;
-	    if ( strchr( host, '/' ) != (char*) 0 )
+	    if ( strchr( host, '/' ) != (char*) 0 || host[0] == '.' )
 		send_error( 400, "Bad Request", "", "Can't parse request." );
 	    }
 	else if ( strncasecmp( line, "If-Modified-Since:", 18 ) == 0 )
@@ -1383,7 +1450,7 @@ do_file( void )
     {
     char buf[10000];
     char mime_encodings[500];
-    char* mime_type;
+    const char* mime_type;
     char fixed_mime_type[500];
     char* cp;
     int fd;
@@ -1557,7 +1624,7 @@ do_dir( void )
 	SERVER_URL, SERVER_SOFTWARE );
     add_to_buf( &contents, &contents_size, &contents_len, buf, buflen );
 
-    add_headers( 200, "Ok", "", "", "text/html", contents_len, sb.st_mtime );
+    add_headers( 200, "Ok", "", "", "text/html; charset=%s", contents_len, sb.st_mtime );
     if ( method != METHOD_HEAD )
 	add_to_response( contents, contents_len );
     send_response();
@@ -1579,15 +1646,9 @@ file_details( const char* dir, const char* name )
 	return "???";
     (void) strftime( f_time, sizeof( f_time ), "%d%b%Y %H:%M", localtime( &sb.st_mtime ) );
     strencode( encname, sizeof(encname), name );
-#ifdef HAVE_INT64T
     (void) snprintf(
 	buf, sizeof( buf ), "<A HREF=\"%s\">%-32.32s</A>    %15s %14lld\n",
 	encname, name, f_time, (int64_t) sb.st_size );
-#else /* HAVE_INT64T */
-    (void) snprintf(
-	buf, sizeof( buf ), "<A HREF=\"%s\">%-32.32s</A>    %15s %14ld\n",
-	encname, name, f_time, (long) sb.st_size );
-#endif /* HAVE_INT64T */
     return buf;
     }
 
@@ -1800,7 +1861,7 @@ static void
 cgi_interpose_input( int wfd )
     {
     size_t c;
-    ssize_t r;
+    ssize_t r, r2;
     char buf[1024];
 
     c = request_len - request_idx;
@@ -1811,22 +1872,27 @@ cgi_interpose_input( int wfd )
 	}
     while ( c < content_length )
 	{
-	r = my_read( buf, min( sizeof(buf), content_length - c ) );
-	if ( r == 0 )
+	r = my_read( buf, MIN( sizeof(buf), content_length - c ) );
+	if ( r < 0 && ( errno == EINTR || errno == EAGAIN ) )
+	    {
+	    sleep( 1 );
+	    continue;
+	    }
+	if ( r <= 0 )
 	    return;
-	else if ( r < 0 )
+	for (;;)
 	    {
-	    if ( errno == EAGAIN )
+	    r2 = write( wfd, buf, r );
+	    if ( r2 < 0 && ( errno == EINTR || errno == EAGAIN ) )
+		{
 		sleep( 1 );
-	    else
+		continue;
+		}
+	    if ( r2 != r )
 		return;
+	    break;
 	    }
-	else
-	    {
-	    if ( write( wfd, buf, r ) != r )
-		return;
-	    c += r;
-	    }
+	c += r;
 	}
     post_post_garbage_hack();
     }
@@ -1862,7 +1928,7 @@ post_post_garbage_hack( void )
 static void
 cgi_interpose_output( int rfd, int parse_headers )
     {
-    ssize_t r;
+    ssize_t r, r2;
     char buf[1024];
 
     if ( ! parse_headers )
@@ -1896,6 +1962,11 @@ cgi_interpose_output( int rfd, int parse_headers )
 	for (;;)
 	    {
 	    r = read( rfd, buf, sizeof(buf) );
+	    if ( r < 0 && ( errno == EINTR || errno == EAGAIN ) )
+		{
+		sleep( 1 );
+		continue;
+		}
 	    if ( r <= 0 )
 		{
 		br = &(headers[headers_len]);
@@ -1954,11 +2025,27 @@ cgi_interpose_output( int rfd, int parse_headers )
     for (;;)
 	{
 	r = read( rfd, buf, sizeof(buf) );
+	if ( r < 0 && ( errno == EINTR || errno == EAGAIN ) )
+	    {
+	    sleep( 1 );
+	    continue;
+	    }
 	if ( r <= 0 )
+	    goto done;
+	for (;;)
+	    {
+	    r2 = my_write( buf, r );
+	    if ( r2 < 0 && ( errno == EINTR || errno == EAGAIN ) )
+		{
+		sleep( 1 );
+		continue;
+		}
+	    if ( r2 != r )
+		goto done;
 	    break;
-	if ( my_write( buf, r ) != r )
-	    break;
+	    }
 	}
+    done:
     shutdown( conn_fd, SHUT_WR );
     }
 
@@ -2098,12 +2185,12 @@ build_env( char* fmt, char* arg )
 	{
 	if ( maxbuf == 0 )
 	    {
-	    maxbuf = 256;
+	    maxbuf = MAX( 200, size + 100 );
 	    buf = (char*) e_malloc( maxbuf );
 	    }
 	else
 	    {
-	    maxbuf *= 2;
+	    maxbuf = MAX( maxbuf * 2, size * 5 / 4 );
 	    buf = (char*) e_realloc( (void*) buf, maxbuf );
 	    }
 	}
@@ -2250,7 +2337,7 @@ static void
 send_error( int s, char* title, char* extra_header, char* text )
     {
     add_headers(
-	s, title, extra_header, "", "text/html", (off_t) -1, (time_t) -1 );
+	s, title, extra_header, "", "text/html; charset=%s", (off_t) -1, (time_t) -1 );
 
     send_error_body( s, title, text );
 
@@ -2361,6 +2448,7 @@ add_headers( int s, char* title, char* extra_header, char* me, char* mt, off_t b
     char timebuf[100];
     char buf[10000];
     int buflen;
+    int s100;
     const char* rfc1123_fmt = "%a, %d %b %Y %H:%M:%S GMT";
 
     status = s;
@@ -2375,6 +2463,12 @@ add_headers( int s, char* title, char* extra_header, char* me, char* mt, off_t b
     (void) strftime( timebuf, sizeof(timebuf), rfc1123_fmt, gmtime( &now ) );
     buflen = snprintf( buf, sizeof(buf), "Date: %s\015\012", timebuf );
     add_to_response( buf, buflen );
+    s100 = status / 100;
+    if ( s100 != 2 && s100 != 3 )
+	{
+	buflen = snprintf( buf, sizeof(buf), "Cache-Control: no-cache,no-store\015\012" );
+	add_to_response( buf, buflen );
+	}
     if ( extra_header != (char*) 0 && extra_header[0] != '\0' )
 	{
 	buflen = snprintf( buf, sizeof(buf), "%s\015\012", extra_header );
@@ -2392,13 +2486,8 @@ add_headers( int s, char* title, char* extra_header, char* me, char* mt, off_t b
 	}
     if ( bytes >= 0 )
 	{
-#ifdef HAVE_INT64T
 	buflen = snprintf(
 	    buf, sizeof(buf), "Content-Length: %lld\015\012", (int64_t) bytes );
-#else /* HAVE_INT64T */
-	buflen = snprintf(
-	    buf, sizeof(buf), "Content-Length: %ld\015\012", (long) bytes );
-#endif /* HAVE_INT64T */
 	add_to_response( buf, buflen );
 	}
     if ( p3p != (char*) 0 && p3p[0] != '\0' )
@@ -2511,15 +2600,30 @@ send_via_write( int fd, off_t size )
 	{
 	/* mmap can't deal with files larger than 2GB. */
 	char buf[30000];
-	ssize_t r;
+	ssize_t r, r2;
 
 	for (;;)
 	    {
 	    r = read( fd, buf, sizeof(buf) );
+	    if ( r < 0 && ( errno == EINTR || errno == EAGAIN ) )
+		{
+		sleep( 1 );
+		continue;
+		}
 	    if ( r <= 0 )
+		return;
+	    for (;;)
+		{
+		r2 = my_write( buf, r );
+		if ( r2 < 0 && ( errno == EINTR || errno == EAGAIN ) )
+		    {
+		    sleep( 1 );
+		    continue;
+		    }
+		if ( r2 != r )
+		    return;
 		break;
-	    if ( my_write( buf, r ) != r )
-		break;
+		}
 	    }
 	}
     }
@@ -2628,12 +2732,8 @@ make_log_entry( void )
 	(void) snprintf( url, sizeof(url), "%s", path );
     /* Format the bytes. */
     if ( bytes >= 0 )
-#ifdef HAVE_INT64T
 	(void) snprintf(
 	    bytes_str, sizeof(bytes_str), "%lld", (int64_t) bytes );
-#else /* HAVE_INT64T */
-	(void) snprintf( bytes_str, sizeof(bytes_str), "%ld", (long) bytes );
-#endif /* HAVE_INT64T */
     else
 	(void) strcpy( bytes_str, "-" );
     /* Format the time, forcing a numeric timezone (some log analyzers
@@ -2683,7 +2783,7 @@ check_referer( void )
 
     /* Lose. */
     if ( vhost && req_hostname != (char*) 0 )
-	cp = req_hostname; 
+	cp = req_hostname;
     else
 	cp = hostname;
     if ( cp == (char*) 0 )
@@ -2829,22 +2929,24 @@ init_mime( void )
 
 
 /* Figure out MIME encodings and type based on the filename.  Multiple
-** encodings are separated by semicolons.
+** encodings are separated by commas, and are listed in the order in
+** which they were applied to the file.
 */
-static char*
+static const char*
 figure_mime( char* name, char* me, size_t me_size )
     {
     char* prev_dot;
     char* dot;
     char* ext;
+    int me_indexes[100], n_me_indexes;
     size_t ext_len, me_len;
     int i, top, bot, mid;
     int r;
-
-    me[0] = '\0';
-    me_len = 0;
+    const char* default_type = "text/plain; charset=%s";
+    const char* type;
 
     /* Peel off encoding extensions until there aren't any more. */
+    n_me_indexes = 0;
     for ( prev_dot = &name[strlen(name)]; ; prev_dot = dot )
 	{
 	for ( dot = prev_dot - 1; dot >= name && *dot != '.'; --dot )
@@ -2854,7 +2956,8 @@ figure_mime( char* name, char* me, size_t me_size )
 	    /* No dot found.  No more encoding extensions, and no type
 	    ** extension either.
 	    */
-	    return "text/plain; charset=%s";
+	    type = default_type;
+	    goto done;
 	    }
 	ext = dot + 1;
 	ext_len = prev_dot - ext;
@@ -2865,15 +2968,10 @@ figure_mime( char* name, char* me, size_t me_size )
 	    {
 	    if ( ext_len == enc_tab[i].ext_len && strncasecmp( ext, enc_tab[i].ext, ext_len ) == 0 )
 		{
-		if ( me[0] != '\0' && me_len + 1 < me_size )
+		if ( n_me_indexes < sizeof(me_indexes)/sizeof(*me_indexes) )
 		    {
-		    (void) strcpy( &me[me_len], "," );
-		    ++me_len;
-		    }
-		if ( me_len + enc_tab[i].val_len < me_size )
-		    {
-		    (void) strcpy( &me[me_len], enc_tab[i].val );
-		    me_len += enc_tab[i].val_len;
+		    me_indexes[n_me_indexes] = i;
+		    ++n_me_indexes;
 		    }
 		goto next;
 		}
@@ -2901,16 +2999,41 @@ figure_mime( char* name, char* me, size_t me_size )
 	    else if ( ext_len > typ_tab[mid].ext_len )
 		bot = mid + 1;
 	    else
-		return typ_tab[mid].val;
+		{
+		type = typ_tab[mid].val;
+		goto done;
+		}
+	}
+    type = default_type;
+
+    done:
+
+    /* The last thing we do is actually generate the mime-encoding header. */
+    me[0] = '\0';
+    me_len = 0;
+    for ( i = n_me_indexes - 1; i >= 0; --i )
+	{
+	if ( me_len + enc_tab[me_indexes[i]].val_len + 1 < me_size )
+	    {
+	    if ( me[0] != '\0' )
+		{
+		(void) strcpy( &me[me_len], "," );
+		++me_len;
+		}
+	    (void) strcpy( &me[me_len], enc_tab[me_indexes[i]].val );
+	    me_len += enc_tab[me_indexes[i]].val_len;
+	    }
 	}
 
-    return "text/plain; charset=%s";
+    return type;
     }
 
 
 static void
 handle_sigterm( int sig )
     {
+    /* Don't need to set up the handler again, since it's a one-shot. */
+
     syslog( LOG_NOTICE, "exiting due to signal %d", sig );
     (void) fprintf( stderr, "%s: exiting due to signal %d\n", argv0, sig );
     closelog();
@@ -2918,14 +3041,35 @@ handle_sigterm( int sig )
     }
 
 
+/* SIGHUP says to re-open the log file. */
+static void
+handle_sighup( int sig )
+    {
+    const int oerrno = errno;
+
+#ifndef HAVE_SIGSET
+    /* Set up handler again. */
+    (void) signal( SIGHUP, handle_sighup );
+#endif /* ! HAVE_SIGSET */
+
+    /* Just set a flag that we got the signal. */
+    got_hup = 1;
+	
+    /* Restore previous errno. */
+    errno = oerrno;
+    }
+
+
 static void
 handle_sigchld( int sig )
     {
+    const int oerrno = errno;
     pid_t pid;
     int status;
 
 #ifndef HAVE_SIGSET
-    (void) signal( SIGCHLD, handle_sigchld );	/* set up handler again */
+    /* Set up handler again. */
+    (void) signal( SIGCHLD, handle_sigchld );
 #endif /* ! HAVE_SIGSET */
 
     /* Reap defunct children until there aren't any more. */
@@ -2940,7 +3084,7 @@ handle_sigchld( int sig )
 	    break;
 	if ( (int) pid < 0 )
 	    {
-	    if ( errno == EINTR )	/* because of ptrace */
+	    if ( errno == EINTR || errno == EAGAIN )
 		continue;
 	    /* ECHILD shouldn't happen with the WNOHANG option,
 	    ** but with some kernels it does anyway.  Ignore it.
@@ -2951,6 +3095,31 @@ handle_sigchld( int sig )
 		perror( "child wait" );
 		}
 	    break;
+	    }
+	}
+
+    /* Restore previous errno. */
+    errno = oerrno;
+    }
+
+
+static void
+re_open_logfile( void )
+    {
+    if ( logfp != (FILE*) 0 )
+	{
+	(void) fclose( logfp );
+	logfp = (FILE*) 0;
+	}
+    if ( logfile != (char*) 0 )
+	{
+	syslog( LOG_NOTICE, "re-opening logfile" );
+	logfp = fopen( logfile, "a" );
+	if ( logfp == (FILE*) 0 )
+	    {
+	    syslog( LOG_CRIT, "%s - %m", logfile );
+	    perror( logfile );
+	    exit( 1 );
 	    }
 	}
     }

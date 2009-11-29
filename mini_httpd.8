@@ -27,6 +27,8 @@ mini_httpd - small HTTP server
 .IR charset ]
 .RB [ -P
 .IR P3P ]
+.RB [ -X
+.IR address ]
 .RB [ -M
 .IR maxage ]
 .RB [ -S ]
@@ -162,6 +164,11 @@ See http://www.w3.org/P3P/ for details.
 Mini_httpd doesn't do anything at all with the string except put it in the
 P3P: response header.
 The config-file option name for this flag is "p3p".
+.TP
+.B -X
+Specifies an address of a proxy server allowed to override a client address
+with "X-Real-IP" header.
+The config-file option name for this flag is "xrealip".
 .TP
 .B -M
 Specifies the number of seconds to be used in a "Cache-Control: max-age"

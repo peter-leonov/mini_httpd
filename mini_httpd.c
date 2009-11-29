@@ -186,6 +186,7 @@ static char* logfile;
 static char* pidfile;
 static char* charset;
 static char* p3p;
+static char* xrealip;
 static int max_age;
 static FILE* logfp;
 static int listen4_fd, listen6_fd;
@@ -226,6 +227,7 @@ static char* host;
 static time_t if_modified_since;
 static char* referer;
 static char* useragent;
+static char* remote_addr;
 
 static char* remoteuser;
 
@@ -332,6 +334,7 @@ main( int argc, char** argv )
     local_pattern = (char*) 0;
     charset = DEFAULT_CHARSET;
     p3p = (char*) 0;
+    xrealip = (char*) 0;
     max_age = -1;
     user = DEFAULT_USER;
     hostname = (char*) 0;
@@ -425,6 +428,11 @@ main( int argc, char** argv )
 	    {
 	    ++argn;
 	    p3p = argv[argn];
+	    }
+	else if ( strcmp( argv[argn], "-X" ) == 0 && argn + 1 < argc )
+	    {
+	    ++argn;
+	    xrealip = argv[argn];
 	    }
 	else if ( strcmp( argv[argn], "-M" ) == 0 && argn + 1 < argc )
 	    {
@@ -990,6 +998,11 @@ read_config( char* filename )
 		value_required( name, value );
 		p3p = e_strdup( value );
 		}
+	    else if ( strcasecmp( name, "xrealip" ) == 0 )
+		{
+		value_required( name, value );
+		xrealip = e_strdup( value );
+		}
 	    else if ( strcasecmp( name, "max_age" ) == 0 )
 		{
 		value_required( name, value );
@@ -1159,6 +1172,7 @@ handle_request( void )
     if_modified_since = (time_t) -1;
     referer = "";
     useragent = "";
+    remote_addr = ntoa( &client_addr );
 
 #ifdef TCP_NOPUSH
     /* Set the TCP_NOPUSH socket option, to try and avoid the 0.2 second
@@ -1275,6 +1289,15 @@ handle_request( void )
 	    cp = &line[11];
 	    cp += strspn( cp, " \t" );
 	    useragent = cp;
+	    }
+	else if ( strncasecmp( line, "X-Real-IP:", 10 ) == 0 )
+	    {
+	    if ( strcmp(remote_addr, xrealip ) == 0 )
+	  	{
+		cp = &line[10];
+		cp += strspn( cp, " \t" );
+		remote_addr = cp;
+		}
 	    }
 	}
 
@@ -1471,7 +1494,7 @@ do_file( void )
 	{
 	syslog(
 	    LOG_NOTICE, "%.80s URL \"%.80s\" tried to retrieve an auth file",
-	    ntoa( &client_addr ), path );
+	    remote_addr, path );
 	send_error( 403, "Forbidden", "", "File is protected." );
 	}
 
@@ -1492,7 +1515,7 @@ do_file( void )
 	{
 	syslog(
 	    LOG_INFO, "%.80s File \"%.80s\" is protected",
-	    ntoa( &client_addr ), path );
+	    remote_addr, path );
 	send_error( 403, "Forbidden", "", "File is protected." );
 	}
     mime_type = figure_mime( file, mime_encodings, sizeof(mime_encodings) );
@@ -1569,7 +1592,7 @@ do_dir( void )
 	{
 	syslog(
 	    LOG_INFO, "%.80s Directory \"%.80s\" is protected",
-	    ntoa( &client_addr ), path );
+	    remote_addr, path );
 	send_error( 403, "Forbidden", "", "Directory is protected." );
 	}
 #endif /* HAVE_SCANDIR */
@@ -2143,7 +2166,7 @@ make_envp( void )
 	}
     if ( query[0] != '\0' )
 	envp[envn++] = build_env( "QUERY_STRING=%s", query );
-    envp[envn++] = build_env( "REMOTE_ADDR=%s", ntoa( &client_addr ) );
+    envp[envn++] = build_env( "REMOTE_ADDR=%s", remote_addr );
     if ( referer[0] != '\0' )
 	envp[envn++] = build_env( "HTTP_REFERER=%s", referer );
     if ( useragent[0] != '\0' )
@@ -2255,7 +2278,7 @@ auth_check( char* dirname )
 	/* The file exists but we can't open it?  Disallow access. */
 	syslog(
 	    LOG_ERR, "%.80s auth file %.80s could not be opened - %m",
-	    ntoa( &client_addr ), authpath );
+	    remote_addr, authpath );
 	send_error( 403, "Forbidden", "", "File is protected." );
 	}
 
@@ -2759,7 +2782,7 @@ make_log_entry( void )
     /* And write the log entry. */
     (void) fprintf( logfp,
 	"%.80s - %.80s [%s] \"%.80s %.200s %.80s\" %d %s \"%.200s\" \"%.200s\"\n",
-	ntoa( &client_addr ), ru, date, get_method_str( method ), url,
+	remote_addr, ru, date, get_method_str( method ), url,
 	protocol, status, bytes_str, referer, useragent );
     (void) fflush( logfp );
     }
@@ -2790,7 +2813,7 @@ check_referer( void )
 	cp = "";
     syslog(
 	LOG_INFO, "%.80s non-local referer \"%.80s%.80s\" \"%.80s\"",
-	ntoa( &client_addr ), cp, path, referer );
+	remote_addr, cp, path, referer );
     send_error( 403, "Forbidden", "", "You must supply a local referer." );
     }
 
@@ -3128,7 +3151,7 @@ re_open_logfile( void )
 static void
 handle_read_timeout( int sig )
     {
-    syslog( LOG_INFO, "%.80s connection timed out reading", ntoa( &client_addr ) );
+    syslog( LOG_INFO, "%.80s connection timed out reading", remote_addr );
     send_error(
 	408, "Request Timeout", "",
 	"No request appeared within a reasonable time period." );
@@ -3138,7 +3161,7 @@ handle_read_timeout( int sig )
 static void
 handle_write_timeout( int sig )
     {
-    syslog( LOG_INFO, "%.80s connection timed out writing", ntoa( &client_addr ) );
+    syslog( LOG_INFO, "%.80s connection timed out writing", remote_addr );
     exit( 1 );
     }
 

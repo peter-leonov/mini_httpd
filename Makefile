@@ -26,7 +26,7 @@ CC =		gcc
 CDEFS =		${SSL_DEFS} ${SSL_INC}
 CFLAGS =	-O ${CDEFS}
 #CFLAGS =	-g ${CDEFS}
-LDFLAGS =	-s
+# LDFLAGS =	-s
 #LDFLAGS =	-g
 LDLIBS =	${SSL_LIBS} ${SYSV_LIBS} ${CRYPT_LIB}
 

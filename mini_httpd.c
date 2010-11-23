@@ -183,12 +183,14 @@ static char* local_pattern;
 static char* hostname;
 static char hostname_buf[500];
 static char* logfile;
+static char* errfile;
 static char* pidfile;
 static char* charset;
 static char* p3p;
 static char* xrealip;
 static int max_age;
 static FILE* logfp;
+static FILE* errfp;
 static int listen4_fd, listen6_fd;
 #ifdef USE_SSL
 static int do_ssl;
@@ -339,8 +341,10 @@ main( int argc, char** argv )
     user = DEFAULT_USER;
     hostname = (char*) 0;
     logfile = (char*) 0;
+    errfile = (char*) 0;
     pidfile = (char*) 0;
     logfp = (FILE*) 0;
+    errfp = (FILE*) 0;
 #ifdef USE_SSL
     do_ssl = 0;
     certfile = DEFAULT_CERTFILE;
@@ -413,6 +417,11 @@ main( int argc, char** argv )
 	    {
 	    ++argn;
 	    logfile = argv[argn];
+	    }
+	else if ( strcmp( argv[argn], "-ll" ) == 0 && argn + 1 < argc )
+	    {
+	    ++argn;
+	    errfile = argv[argn];
 	    }
 	else if ( strcmp( argv[argn], "-i" ) == 0 && argn + 1 < argc )
 	    {
@@ -507,6 +516,35 @@ main( int argc, char** argv )
 		perror( "fchown logfile" );
 		}
 	    }
+	}
+
+	/* Error file. */
+    if ( errfile != (char*) 0 )
+	{
+	errfp = fopen( errfile, "a" );
+	if ( errfp == (FILE*) 0 )
+	    {
+	    syslog( LOG_CRIT, "%s - %m", errfile );
+	    perror( errfile );
+	    exit( 1 );
+	    }
+	if ( errfile[0] != '/' )
+	    {
+	    syslog( LOG_WARNING, "errfile is not an absolute path, you may not be able to re-open it" );
+	    (void) fprintf( stderr, "%s: errfile is not an absolute path, you may not be able to re-open it\n", argv0 );
+	    }
+	if ( getuid() == 0 )
+	    {
+	    /* If we are root then we chown the log file to the user we'll
+	    ** be switching to.
+	    */
+	    if ( fchown( fileno( errfp ), uid, gid ) < 0 )
+		{
+		syslog( LOG_WARNING, "fchown errfile - %m" );
+		perror( "fchown errfile" );
+		}
+	    }
+	dup2( fileno( errfp ), STDERR_FILENO );
 	}
 
     /* Look up hostname. */
@@ -697,6 +735,25 @@ main( int argc, char** argv )
 		syslog( LOG_WARNING, "logfile is not within the chroot tree, you will not be able to re-open it" );
 		(void) fprintf( stderr, "%s: logfile is not within the chroot tree, you will not be able to re-open it\n", argv0 );
 		}
+	/* If we're logging and the errfile's pathname begins with the
+	** chroot tree's pathname, then elide the chroot pathname so
+	** that the errfile pathname still works from inside the chroot
+	** tree.
+	*/
+	if ( errfile != (char*) 0 )
+	    if ( strncmp( errfile, cwd, strlen( cwd ) ) == 0 )
+		{
+		(void) strcpy( errfile, &errfile[strlen( cwd ) - 1] );
+		/* (We already guaranteed that cwd ends with a slash, so leaving
+		** that slash in errfile makes it an absolute pathname within
+		** the chroot tree.)
+		*/
+		}
+	    else
+		{
+		syslog( LOG_WARNING, "errfile is not within the chroot tree, you will not be able to re-open it" );
+		(void) fprintf( stderr, "%s: errfile is not within the chroot tree, you will not be able to re-open it\n", argv0 );
+		}
 	(void) strcpy( cwd, "/" );
 	/* Always chdir to / after a chroot. */
 	if ( chdir( cwd ) < 0 )
@@ -863,9 +920,9 @@ static void
 usage( void )
     {
 #ifdef USE_SSL
-    (void) fprintf( stderr, "usage:  %s [-C configfile] [-D] [-S] [-E certfile] [-Y cipher] [-p port] [-d dir] [-dd data_dir] [-c cgipat] [-u user] [-h hostname] [-r] [-v] [-l logfile] [-i pidfile] [-T charset] [-P P3P] [-M maxage]\n", argv0 );
+    (void) fprintf( stderr, "usage:  %s [-C configfile] [-D] [-S] [-E certfile] [-Y cipher] [-p port] [-d dir] [-dd data_dir] [-c cgipat] [-u user] [-h hostname] [-r] [-v] [-l logfile] [-ll errfile] [-i pidfile] [-T charset] [-P P3P] [-M maxage]\n", argv0 );
 #else /* USE_SSL */
-    (void) fprintf( stderr, "usage:  %s [-C configfile] [-D] [-p port] [-d dir] [-dd data_dir] [-c cgipat] [-u user] [-h hostname] [-r] [-v] [-l logfile] [-i pidfile] [-T charset] [-P P3P] [-M maxage]\n", argv0 );
+    (void) fprintf( stderr, "usage:  %s [-C configfile] [-D] [-p port] [-d dir] [-dd data_dir] [-c cgipat] [-u user] [-h hostname] [-r] [-v] [-l logfile] [-ll errfile] [-i pidfile] [-T charset] [-P P3P] [-M maxage]\n", argv0 );
 #endif /* USE_SSL */
     exit( 1 );
     }
@@ -977,6 +1034,11 @@ read_config( char* filename )
 		{
 		value_required( name, value );
 		logfile = e_strdup( value );
+		}
+	    else if ( strcasecmp( name, "errfile" ) == 0 )
+		{
+		value_required( name, value );
+		errfile = e_strdup( value );
 		}
 	    else if ( strcasecmp( name, "vhost" ) == 0 )
 		{
@@ -3144,6 +3206,24 @@ re_open_logfile( void )
 	    perror( logfile );
 	    exit( 1 );
 	    }
+	}
+
+    if ( errfp != (FILE*) 0 )
+	{
+	(void) fclose( errfp );
+	errfp = (FILE*) 0;
+	}
+    if ( errfile != (char*) 0 )
+	{
+	syslog( LOG_NOTICE, "re-opening errfile" );
+	errfp = fopen( errfile, "a" );
+	if ( errfp == (FILE*) 0 )
+	    {
+	    syslog( LOG_CRIT, "%s - %m", errfile );
+	    perror( errfile );
+	    exit( 1 );
+	    }
+	dup2( fileno( errfp ), STDERR_FILENO );
 	}
     }
 

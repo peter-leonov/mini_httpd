@@ -21,6 +21,8 @@ mini_httpd - small HTTP server
 .RB [ -v ]
 .RB [ -l
 .IR logfile ]
+.RB [ -ll
+.IR errfile ]
 .RB [ -i
 .IR pidfile ]
 .RB [ -T
@@ -146,6 +148,10 @@ The config-file option name for this flag is "vhost".
 Specifies a log file name.
 The default is no logging.
 The config-file option name for this flag is "logfile".
+.B -ll
+Specifies an error log file name.
+The default is no logging.
+The config-file option name for this flag is "errfile".
 .TP
 .B -i
 Specifies a file to write the process-id to.

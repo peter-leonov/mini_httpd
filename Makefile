@@ -7,7 +7,7 @@
 # CONFIGURE: Some systems don't need -lcrypt, and indeed they get an
 # error if you try to link with it.  If you get an error about libcrypt
 # not found, try commenting out this definition.
-CRYPT_LIB =    -lcrypt
+# CRYPT_LIB =    -lcrypt
 
 # CONFIGURE: If you want to compile in support for https, uncomment these
 # definitions.  You will need to have already built OpenSSL, available at

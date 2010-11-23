@@ -168,6 +168,7 @@ typedef union {
     } usockaddr;
 
 
+extern char** environ;
 static char* argv0;
 static int debug;
 static unsigned short port;
@@ -185,6 +186,7 @@ static char hostname_buf[500];
 static char* logfile;
 static char* errfile;
 static char* pidfile;
+static int cgipassenv;
 static char* charset;
 static char* p3p;
 static char* xrealip;
@@ -1039,6 +1041,11 @@ read_config( char* filename )
 		{
 		value_required( name, value );
 		errfile = e_strdup( value );
+		}
+	    else if ( strcasecmp( name, "cgipassenv" ) == 0 )
+		{
+		no_value_required( name, value );
+		cgipassenv = 1;
 		}
 	    else if ( strcasecmp( name, "vhost" ) == 0 )
 		{
@@ -2200,12 +2207,29 @@ make_envp( void )
     {
     static char* envp[50];
     int envn;
+    int i;
     char* cp;
+    char* pair;
     char buf[256];
 
     envn = 0;
-    envp[envn++] = build_env( "PATH=%s", CGI_PATH );
-    envp[envn++] = build_env( "LD_LIBRARY_PATH=%s", CGI_LD_LIBRARY_PATH );
+	
+	if (cgipassenv)
+	{
+		/* Copy the full environment. */
+		i = 0;
+		while (pair = environ[i])
+		{
+			envp[envn++] = environ[i];
+			i++;
+		}
+	}
+	else
+	{
+		envp[envn++] = build_env( "PATH=%s", CGI_PATH );
+		envp[envn++] = build_env( "LD_LIBRARY_PATH=%s", CGI_LD_LIBRARY_PATH );
+	}
+	
     envp[envn++] = build_env( "SERVER_SOFTWARE=%s", SERVER_SOFTWARE );
     if ( ! vhost )
 	cp = hostname;

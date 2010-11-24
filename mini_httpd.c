@@ -345,6 +345,7 @@ main( int argc, char** argv )
     logfile = (char*) 0;
     errfile = (char*) 0;
     pidfile = (char*) 0;
+	cgipassenv = 0;
     logfp = (FILE*) 0;
     errfp = (FILE*) 0;
 #ifdef USE_SSL

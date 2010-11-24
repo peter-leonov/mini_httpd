@@ -187,6 +187,7 @@ static char* logfile;
 static char* errfile;
 static char* pidfile;
 static int cgipassenv;
+static int tcp_nopush;
 static char* charset;
 static char* p3p;
 static char* xrealip;
@@ -346,6 +347,7 @@ main( int argc, char** argv )
     errfile = (char*) 0;
     pidfile = (char*) 0;
 	cgipassenv = 0;
+    tcp_nopush = 0;
     logfp = (FILE*) 0;
     errfp = (FILE*) 0;
 #ifdef USE_SSL
@@ -1048,6 +1050,11 @@ read_config( char* filename )
 		no_value_required( name, value );
 		cgipassenv = 1;
 		}
+	    else if ( strcasecmp( name, "tcp_nopush" ) == 0 )
+		{
+		no_value_required( name, value );
+		tcp_nopush = 1;
+		}
 	    else if ( strcasecmp( name, "vhost" ) == 0 )
 		{
 		no_value_required( name, value );
@@ -1250,9 +1257,12 @@ handle_request( void )
     ** solution is writev() (as used in thttpd), or send the headers with
     ** send(MSG_MORE) (only available in Linux so far).
     */
-    r = 1;
-    (void) setsockopt(
-	conn_fd, IPPROTO_TCP, TCP_NOPUSH, (void*) &r, sizeof(r) );
+    if (tcp_nopush)
+	{
+	    r = 1;
+	    (void) setsockopt(
+		conn_fd, IPPROTO_TCP, TCP_NOPUSH, (void*) &r, sizeof(r) );
+	}
 #endif /* TCP_NOPUSH */
 
 #ifdef USE_SSL

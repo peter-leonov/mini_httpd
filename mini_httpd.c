@@ -2283,7 +2283,10 @@ make_envp( void )
     if ( remoteuser != (char*) 0 )
 	envp[envn++] = build_env( "REMOTE_USER=%s", remoteuser );
     if ( authorization != (char*) 0 )
+    {
 	envp[envn++] = build_env( "AUTH_TYPE=%s", "Basic" );
+	envp[envn++] = build_env( "HTTP_AUTHORIZATION=%s", authorization );
+    }
     if ( getenv( "TZ" ) != (char*) 0 )
 	envp[envn++] = build_env( "TZ=%s", getenv( "TZ" ) );
 

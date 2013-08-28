@@ -595,7 +595,7 @@ main( int argc, char** argv )
 	SSLeay_add_ssl_algorithms();
 	ssl_ctx = SSL_CTX_new( SSLv23_server_method() );
 	if ( certfile[0] != '\0' )
-	    if ( SSL_CTX_use_certificate_file( ssl_ctx, certfile, SSL_FILETYPE_PEM ) == 0 ||
+	    if ( SSL_CTX_use_certificate_chain_file( ssl_ctx, certfile ) == 0 ||
 		 SSL_CTX_use_PrivateKey_file( ssl_ctx, certfile, SSL_FILETYPE_PEM ) == 0 ||
 		 SSL_CTX_check_private_key( ssl_ctx ) == 0 )
 		{
@@ -605,6 +605,11 @@ main( int argc, char** argv )
 	if ( cipher != (char*) 0 )
 	    {
 	    if ( SSL_CTX_set_cipher_list( ssl_ctx, cipher ) == 0 )
+		{
+		ERR_print_errors_fp( stderr );
+		exit( 1 );
+		}
+            if ( SSL_CTX_set_options( ssl_ctx, SSL_OP_CIPHER_SERVER_PREFERENCE ) == 0 )
 		{
 		ERR_print_errors_fp( stderr );
 		exit( 1 );

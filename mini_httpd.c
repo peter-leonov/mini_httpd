@@ -609,6 +609,11 @@ main( int argc, char** argv )
 		ERR_print_errors_fp( stderr );
 		exit( 1 );
 		}
+            if ( SSL_CTX_set_options( ssl_ctx, SSL_OP_CIPHER_SERVER_PREFERENCE ) == 0 )
+		{
+		ERR_print_errors_fp( stderr );
+		exit( 1 );
+		}
 	    }
 	}
 #endif /* USE_SSL */
